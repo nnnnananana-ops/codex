@@ -602,7 +602,7 @@ async function saveCanvasToFirebase(content, title, canvasId) {
         
         // Firestore REST API로 문서 생성 (자동 ID)
         const response = await fetch(
-          `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/(default)/documents/shn-sessions?key=${firebaseConfig.apiKey}`,
+          `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/codex/documents/shn-sessions?key=${firebaseConfig.apiKey}`,
           {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -1582,4 +1582,5 @@ if (typeof document !== 'undefined') {
 }
 
 })(typeof window !== 'undefined' ? window : this);
+
 
