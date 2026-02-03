@@ -18,12 +18,35 @@
 // ============================================
 let firebaseConfig = null;
 let currentSessionId = null;
+let currentSubject = null;  // 현재 주제 (세션 식별용)
 let sessionsCache = [];
 
 // ============================================
-// 설정 관리 (localStorage)
+// 설정 관리 (window.__CODEX_CONFIG__ 우선, localStorage 폴백)
 // ============================================
 const CONFIG_KEY = 'shn-lite-config';
+
+/**
+ * 임베디드 설정 가져오기 (HTML 템플릿에서 하드코딩된 값)
+ */
+function getEmbeddedConfig() {
+  const embedded = global.__CODEX_CONFIG__;
+  if (!embedded) return null;
+  
+  // 플레이스홀더가 아닌 실제 값인지 확인
+  const isValidKey = (key) => key && !key.startsWith('{YOUR_');
+  
+  return {
+    firebase: isValidKey(embedded.firebaseApiKey) ? {
+      apiKey: embedded.firebaseApiKey,
+      projectId: embedded.firebaseProjectId
+    } : null,
+    llm: isValidKey(embedded.geminiApiKey) ? {
+      apiKey: embedded.geminiApiKey,
+      model: embedded.geminiModel || 'gemini-2.0-flash'
+    } : null
+  };
+}
 
 function loadConfig() {
   try {
@@ -38,11 +61,21 @@ function saveConfig(config) {
 }
 
 function getFirebaseConfig() {
+  // 1. 임베디드 설정 우선
+  const embedded = getEmbeddedConfig();
+  if (embedded?.firebase) return embedded.firebase;
+  
+  // 2. localStorage 폴백
   const config = loadConfig();
   return config.firebase || null;
 }
 
 function getLLMConfig() {
+  // 1. 임베디드 설정 우선
+  const embedded = getEmbeddedConfig();
+  if (embedded?.llm) return embedded.llm;
+  
+  // 2. localStorage 폴백
   const config = loadConfig();
   return config.llm || { apiKey: '', model: 'gemini-2.0-flash' };
 }
@@ -438,251 +471,187 @@ function renderDashboard() {
   }
 }
 
-// Firebase 저장 (REST API)
+/**
+ * HTML → Markdown 변환 (bundle.js의 _convertHtmlToNarrativeSnapshot 기반)
+ * @param {string} htmlContent - HTML 콘텐츠
+ * @param {number} turn - 턴 번호
+ * @returns {string} - Markdown 형식
+ */
+function convertHtmlToMarkdown(htmlContent, turn) {
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(htmlContent, 'text/html');
+  
+  let markdown = `\n\n## [턴 ${turn}]\n\n`;
+  
+  // Header 정보 추출
+  const header = doc.querySelector('.header');
+  if (header) {
+    const mainTitle = header.querySelector('h1');
+    const subtitle = header.querySelector('.subtitle');
+    
+    if (mainTitle) {
+      markdown += `### @mainTitle: ${mainTitle.textContent.trim()}\n`;
+    }
+    if (subtitle) {
+      markdown += `### @mainSubtitle: ${subtitle.textContent.trim()}\n`;
+    }
+    markdown += '\n';
+  }
+  
+  // Content sections 파싱
+  const contentSections = doc.querySelectorAll('.content-section');
+  
+  contentSections.forEach(section => {
+    // Paragraph
+    if (section.classList.contains('type-paragraph')) {
+      const paragraphs = section.querySelectorAll('p');
+      paragraphs.forEach(p => {
+        markdown += `${p.textContent.trim()}\n\n`;
+      });
+    }
+    
+    // Blockquote
+    else if (section.classList.contains('type-blockquote')) {
+      const blockquote = section.querySelector('blockquote');
+      if (blockquote) {
+        const lines = blockquote.textContent.trim().split('\n');
+        markdown += lines.map(line => `> ${line.trim()}`).join('\n') + '\n\n';
+      }
+    }
+    
+    // Heading
+    else if (section.classList.contains('type-heading-h2')) {
+      const h2 = section.querySelector('h2');
+      if (h2) {
+        markdown += `## ${h2.textContent.trim()}\n\n`;
+      }
+    }
+    
+    // Status Dashboard
+    else if (section.classList.contains('type-status-dashboard')) {
+      markdown += '### 상태 정보\n\n';
+      
+      const dashboardSections = section.querySelectorAll('.dashboard-section');
+      dashboardSections.forEach(ds => {
+        const title = ds.querySelector('.dashboard-section-title');
+        const items = ds.querySelectorAll('.dashboard-item');
+        
+        if (title && items.length > 0) {
+          markdown += `**${title.textContent.trim()}**\n`;
+          items.forEach(item => {
+            const key = item.querySelector('.key');
+            const value = item.querySelector('.value');
+            if (key && value) {
+              markdown += `- **${key.textContent.trim()}:** ${value.textContent.trim()}\n`;
+            }
+          });
+          markdown += '\n';
+        }
+      });
+      
+      markdown += '---\n\n';
+    }
+    
+    // Ordered List (선택지)
+    else if (section.classList.contains('type-ordered-list')) {
+      markdown += '### 제시된 선택지\n\n';
+      const items = section.querySelectorAll('li');
+      items.forEach((item, idx) => {
+        markdown += `${idx + 1}. ${item.textContent.trim()}\n`;
+      });
+      markdown += '\n';
+    }
+  });
+  
+  return markdown;
+}
+
+// Firebase 저장 (세션 기반) - bundle.js 구조 적용
 async function saveCanvasToFirebase(content, title, canvasId) {
   if (!firebaseConfig) return;
   
   try {
-    await firestoreSet('canvas', canvasId, {
-      content: content,
+    // data-turn 추출
+    const turnMatch = content.match(/data-turn=["'](\d+)["']/i);
+    const turn = turnMatch ? parseInt(turnMatch[1], 10) : 1;
+    
+    // data-subject (주제) 추출
+    const subjectMatch = content.match(/data-subject=["']([^"']+)["']/i);
+    const subject = subjectMatch ? subjectMatch[1] : 'General';
+    
+    // HTML → Markdown 변환
+    const markdown = convertHtmlToMarkdown(content, turn);
+    
+    // 세션 ID 결정: 주제가 바뀌면 새 세션 생성
+    if (!currentSessionId || currentSubject !== subject) {
+      // 기존 세션 검색 (같은 주제)
+      const existingSessions = await firestoreList('shn-sessions');
+      const matchingSession = existingSessions.find(s => s.subject === subject);
+      
+      if (matchingSession) {
+        currentSessionId = matchingSession._id;
+      } else {
+        // 새 세션 생성
+        const sessionData = {
+          subject: subject,
+          title: `[${subject}] 서사 기록`,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+          turnCount: 0
+        };
+        
+        // Firestore REST API로 문서 생성 (자동 ID)
+        const response = await fetch(
+          `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/(default)/documents/shn-sessions?key=${firebaseConfig.apiKey}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ fields: convertToFirestoreFields(sessionData) })
+          }
+        );
+        
+        if (!response.ok) throw new Error('세션 생성 실패');
+        
+        const doc = await response.json();
+        currentSessionId = doc.name.split('/').pop();
+      }
+      
+      currentSubject = subject;
+    }
+    
+    // 턴 데이터를 세션의 하위 컬렉션에 저장
+    const turnData = {
+      turnNumber: turn,
+      content: markdown,
+      rawHtml: content,
       title: title,
-      canvasId: canvasId,
-      savedAt: serverTimestamp()
+      timestamp: serverTimestamp()
+    };
+    
+    await firestoreSet(`shn-sessions/${currentSessionId}/turns`, `turn_${turn}`, turnData);
+    
+    // 세션의 턴 카운트 업데이트
+    await firestoreSet('shn-sessions', currentSessionId, {
+      updatedAt: serverTimestamp(),
+      turnCount: turn,
+      lastTurnTitle: title
     });
-    console.log('✅ Canvas 저장됨:', canvasId);
+    
+    console.log('✅ 세션 저장됨:', currentSessionId, '| 주제:', subject, '| 턴:', turn);
   } catch (e) {
     console.error('Canvas 저장 실패:', e);
   }
 }
 
-// ============================================
-// 데이터 추출 유틸리티
-// ============================================
-function chunkByMarker(text, markerType, chunkSize = 1) {
-  let regex;
-  switch (markerType) {
-    case 'day':
-      regex = /(?=\[📅\s*(?:Day|날짜)[:\s]*\d+\])/gi;
-      break;
-    case 'episode':
-      regex = /(?=\[📖\s*(?:Episode|에피소드)[:\s]*\d+\])/gi;
-      break;
-    case 'turn':
-    default:
-      regex = /(?=##\s*\[턴\s*\d+\])/gi;
-      break;
-  }
-  
-  const rawChunks = text.split(regex).filter(c => c.trim());
-  const grouped = [];
-  for (let i = 0; i < rawChunks.length; i += chunkSize) {
-    grouped.push(rawChunks.slice(i, i + chunkSize).join('\n\n'));
-  }
-  return grouped;
-}
-
-// ============================================
-// LLM 기반 데이터 추출
-// ============================================
-
 /**
- * LLM API 호출 (Gemini API)
- * @param {string} prompt - 시스템 프롬프트
- * @param {string} content - 추출할 콘텐츠
- * @returns {Promise<object>} - 파싱된 JSON 응답
+ * Firestore 필드 변환 헬퍼
  */
-async function callLLM(prompt, content) {
-  const config = getLLMConfig();
-  
-  if (!config.apiKey) {
-    throw new Error('LLM 설정이 필요합니다. saveConfig({ llm: { apiKey, model } })');
+function convertToFirestoreFields(data) {
+  const fields = {};
+  for (const [key, value] of Object.entries(data)) {
+    fields[key] = convertToFirestoreValue(value);
   }
-  
-  const model = config.model || 'gemini-2.0-flash';
-  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${config.apiKey}`;
-  
-  const response = await fetch(endpoint, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-      contents: [
-        {
-          parts: [
-            { text: `${prompt}\n\n---\n\n${content}` }
-          ]
-        }
-      ],
-      generationConfig: {
-        temperature: 0.1,
-        responseMimeType: 'application/json'
-      }
-    })
-  });
-  
-  if (!response.ok) {
-    const errorData = await response.json().catch(() => ({}));
-    throw new Error(`Gemini API 오류: ${response.status} ${errorData.error?.message || response.statusText}`);
-  }
-  
-  const data = await response.json();
-  const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
-  return JSON.parse(text);
-}
-
-/**
- * 마이크로 단위 추출 (턴 단위 상태 변화)
- * @param {string} turnContent - 단일 턴 콘텐츠
- * @returns {Promise<object>} - 추출된 마이크로 데이터
- */
-async function extractMicro(turnContent) {
-  const prompt = `You are a data extraction assistant. Extract micro-level state changes from this game turn.
-Return JSON with this structure:
-{
-  "turn": number,
-  "timestamp": "in-game time if mentioned",
-  "pc_changes": {
-    "stats": { "stat_name": delta_number },
-    "condition": { "fatigue": delta, "mental": delta, "health": delta },
-    "skills_used": ["skill1", "skill2"]
-  },
-  "npc_interactions": [
-    { "npc_id": "name", "action": "description", "intimacy_change": delta }
-  ],
-  "events": ["event1", "event2"],
-  "choices_made": ["choice description"],
-  "outcomes": { "success": boolean, "z_grade": number_if_mentioned }
-}
-Only include fields with actual data. Use null for unknown values.`;
-
-  return await callLLM(prompt, turnContent);
-}
-
-/**
- * 메소 단위 추출 (Day/Episode 요약)
- * @param {string} chunkContent - Day 또는 Episode 콘텐츠
- * @param {string} chunkType - 'day' 또는 'episode'
- * @returns {Promise<object>} - 추출된 메소 데이터
- */
-async function extractMeso(chunkContent, chunkType = 'day') {
-  const prompt = `You are a narrative analyst. Summarize this ${chunkType} of gameplay.
-Return JSON with this structure:
-{
-  "${chunkType}_number": number,
-  "summary": "2-3 sentence narrative summary in Korean",
-  "key_events": ["major event 1", "major event 2"],
-  "relationship_changes": [
-    { "npc": "name", "from_level": number, "to_level": number, "reason": "brief" }
-  ],
-  "stat_progression": {
-    "notable_changes": ["stat improved", "condition worsened"]
-  },
-  "narrative_beats": ["setup", "conflict", "resolution"],
-  "cliffhangers": ["unresolved tension"],
-  "themes": ["theme1", "theme2"]
-}
-Write summary in Korean. Other fields can be English or Korean.`;
-
-  return await callLLM(prompt, chunkContent);
-}
-
-/**
- * 매크로 단위 추출 (전체 세션/Phase 요약)
- * @param {string} fullContent - 전체 세션 콘텐츠
- * @returns {Promise<object>} - 추출된 매크로 데이터
- */
-async function extractMacro(fullContent) {
-  const prompt = `You are a story analyst. Analyze the overall narrative arc of this game session.
-Return JSON with this structure:
-{
-  "session_summary": "Overall narrative summary in Korean (3-5 sentences)",
-  "protagonist_arc": {
-    "starting_state": "description",
-    "ending_state": "description", 
-    "growth": ["growth point 1", "growth point 2"],
-    "setbacks": ["setback 1"]
-  },
-  "key_relationships": [
-    { "npc": "name", "relationship_type": "rival/ally/mentor/etc", "arc": "brief description" }
-  ],
-  "major_turning_points": ["turning point 1", "turning point 2"],
-  "unresolved_threads": ["thread 1", "thread 2"],
-  "emotional_journey": ["emotion1 → emotion2 → emotion3"],
-  "phase_progress": { "current": number, "of": number }
-}
-Write summaries in Korean.`;
-
-  return await callLLM(prompt, fullContent);
-}
-
-/**
- * 배치 추출 - 청크 단위로 순차 처리
- * @param {string} fullText - 전체 텍스트
- * @param {string} markerType - 'turn', 'day', 'episode'
- * @param {string} extractionLevel - 'micro', 'meso', 'macro'
- * @param {function} onProgress - 진행 콜백 (current, total)
- * @returns {Promise<array>} - 추출 결과 배열
- */
-async function batchExtract(fullText, markerType = 'turn', extractionLevel = 'micro', onProgress = null) {
-  const chunks = chunkByMarker(fullText, markerType);
-  const results = [];
-  
-  for (let i = 0; i < chunks.length; i++) {
-    try {
-      let result;
-      switch (extractionLevel) {
-        case 'meso':
-          result = await extractMeso(chunks[i], markerType);
-          break;
-        case 'macro':
-          result = await extractMacro(chunks[i]);
-          break;
-        case 'micro':
-        default:
-          result = await extractMicro(chunks[i]);
-      }
-      results.push({ index: i, success: true, data: result });
-    } catch (e) {
-      results.push({ index: i, success: false, error: e.message });
-    }
-    
-    if (onProgress) {
-      onProgress(i + 1, chunks.length);
-    }
-    
-    // Rate limiting - 500ms 딜레이
-    if (i < chunks.length - 1) {
-      await new Promise(r => setTimeout(r, 500));
-    }
-  }
-  
-  return results;
-}
-
-/**
- * 추출 결과를 Firebase에 저장
- * @param {string} sessionId - 세션 ID
- * @param {array} extractedData - 추출 결과
- * @param {string} extractionType - 추출 타입
- */
-async function saveExtractedData(sessionId, extractedData, extractionType) {
-  if (extractionType === undefined) extractionType = 'micro';
-  
-  if (!firebaseConfig) {
-    if (!initFirebase()) {
-      throw new Error('Firebase 연결 필요');
-    }
-  }
-  
-  await firestoreSet('extractions', sessionId + '_' + extractionType, {
-    sessionId: sessionId,
-    extractionType: extractionType,
-    data: extractedData,
-    extractedAt: serverTimestamp()
-  });
-  
-  console.log('✅ 추출 데이터 저장됨: ' + sessionId + '_' + extractionType);
+  return fields;
 }
 
 // ============================================
@@ -732,6 +701,11 @@ function openSettingsModal() {
   const llm = config.llm || {};
   const firebase = config.firebase || {};
   
+  // 임베디드 설정 확인
+  const embedded = getEmbeddedConfig();
+  const hasEmbeddedLLM = !!embedded?.llm;
+  const hasEmbeddedFirebase = !!embedded?.firebase;
+  
   const modal = document.createElement('div');
   modal.id = 'shn-settings-modal';
   modal.style.cssText = `
@@ -752,120 +726,189 @@ function openSettingsModal() {
       background: var(--bg-secondary, #12121e);
       border-radius: 12px;
       padding: 30px;
-      max-width: 500px;
+      max-width: 600px;
       width: 90%;
-      max-height: 80vh;
+      max-height: 85vh;
       overflow-y: auto;
       border: 1px solid var(--border, #2a2a4a);
     ">
       <h2 style="color: var(--accent, #ffd700); margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center;">
-        ⚙️ 설정
+        ⚙️ SHN Lite
         <button id="shn-settings-close" style="background: none; border: none; color: var(--text-dim, #888); font-size: 24px; cursor: pointer;">✕</button>
       </h2>
       
-      <div style="margin-bottom: 25px;">
-        <h3 style="color: var(--text, #e8e8e8); margin-bottom: 12px; font-size: 0.95rem;">🤖 Gemini API</h3>
-        <div style="margin-bottom: 10px;">
-          <label style="display: block; color: var(--text-dim, #888); font-size: 0.85rem; margin-bottom: 4px;">API Key</label>
-          <input type="password" id="shn-llm-apikey" value="${llm.apiKey || ''}" placeholder="AIza..." style="
-            width: 100%;
-            padding: 10px 12px;
-            background: var(--bg-card, #1a1a2e);
-            border: 1px solid var(--border, #2a2a4a);
-            border-radius: 6px;
-            color: var(--text, #e8e8e8);
-            font-size: 0.9rem;
-          ">
-        </div>
-        <div>
-          <label style="display: block; color: var(--text-dim, #888); font-size: 0.85rem; margin-bottom: 4px;">Model</label>
-          <select id="shn-llm-model" style="
-            width: 100%;
-            padding: 10px 12px;
-            background: var(--bg-card, #1a1a2e);
-            border: 1px solid var(--border, #2a2a4a);
-            border-radius: 6px;
-            color: var(--text, #e8e8e8);
-            font-size: 0.9rem;
-          ">
-            <option value="gemini-3.0-pro" ${llm.model === 'gemini-3.0-pro' ? 'selected' : ''}>Gemini 3.0 Pro</option>
-            <option value="gemini-2.0-flash" ${llm.model === 'gemini-2.0-flash' ? 'selected' : ''}>Gemini 2.0 Flash</option>
-            <option value="gemini-2.0-flash-lite" ${llm.model === 'gemini-2.0-flash-lite' ? 'selected' : ''}>Gemini 2.0 Flash Lite</option>
-            <option value="gemini-1.5-pro" ${llm.model === 'gemini-1.5-pro' ? 'selected' : ''}>Gemini 1.5 Pro</option>
-            <option value="gemini-1.5-flash" ${llm.model === 'gemini-1.5-flash' ? 'selected' : ''}>Gemini 1.5 Flash</option>
-          </select>
-        </div>
-      </div>
-      
-      <div style="margin-bottom: 25px;">
-        <h3 style="color: var(--text, #e8e8e8); margin-bottom: 12px; font-size: 0.95rem;">🔥 Firebase (선택)</h3>
-        <div style="margin-bottom: 10px;">
-          <label style="display: block; color: var(--text-dim, #888); font-size: 0.85rem; margin-bottom: 4px;">API Key</label>
-          <input type="password" id="shn-fb-apikey" value="${firebase.apiKey || ''}" placeholder="Firebase API Key" style="
-            width: 100%;
-            padding: 10px 12px;
-            background: var(--bg-card, #1a1a2e);
-            border: 1px solid var(--border, #2a2a4a);
-            border-radius: 6px;
-            color: var(--text, #e8e8e8);
-            font-size: 0.9rem;
-          ">
-        </div>
-        <div style="margin-bottom: 10px;">
-          <label style="display: block; color: var(--text-dim, #888); font-size: 0.85rem; margin-bottom: 4px;">Project ID</label>
-          <input type="text" id="shn-fb-projectid" value="${firebase.projectId || ''}" placeholder="my-project-id" style="
-            width: 100%;
-            padding: 10px 12px;
-            background: var(--bg-card, #1a1a2e);
-            border: 1px solid var(--border, #2a2a4a);
-            border-radius: 6px;
-            color: var(--text, #e8e8e8);
-            font-size: 0.9rem;
-          ">
-        </div>
-        <div>
-          <label style="display: block; color: var(--text-dim, #888); font-size: 0.85rem; margin-bottom: 4px;">Auth Domain</label>
-          <input type="text" id="shn-fb-authdomain" value="${firebase.authDomain || ''}" placeholder="my-project.firebaseapp.com" style="
-            width: 100%;
-            padding: 10px 12px;
-            background: var(--bg-card, #1a1a2e);
-            border: 1px solid var(--border, #2a2a4a);
-            border-radius: 6px;
-            color: var(--text, #e8e8e8);
-            font-size: 0.9rem;
-          ">
-        </div>
-      </div>
-      
-      <div style="display: flex; gap: 10px;">
-        <button id="shn-settings-save" style="
-          flex: 1;
-          padding: 12px;
+      <!-- 탭 버튼 -->
+      <div style="display: flex; gap: 5px; margin-bottom: 20px; border-bottom: 1px solid var(--border, #2a2a4a); padding-bottom: 10px;">
+        <button class="shn-tab-btn" data-tab="settings" style="
+          padding: 8px 16px;
           background: var(--accent, #ffd700);
           color: #000;
           border: none;
-          border-radius: 6px;
+          border-radius: 6px 6px 0 0;
+          cursor: pointer;
           font-weight: bold;
+        ">⚙️ 설정</button>
+        <button class="shn-tab-btn" data-tab="sessions" style="
+          padding: 8px 16px;
+          background: var(--bg-card, #1a1a2e);
+          color: var(--text-dim, #888);
+          border: none;
+          border-radius: 6px 6px 0 0;
           cursor: pointer;
-          transition: opacity 0.2s;
-        ">💾 저장</button>
-        <button id="shn-settings-clear" style="
-          padding: 12px 20px;
-          background: transparent;
-          color: var(--error, #ff6b6b);
-          border: 1px solid var(--error, #ff6b6b);
-          border-radius: 6px;
-          cursor: pointer;
-        ">🗑️ 초기화</button>
+        ">📚 세션</button>
       </div>
       
-      <p style="margin-top: 15px; font-size: 0.75rem; color: var(--text-dim, #888); text-align: center;">
-        🔒 설정은 브라우저 localStorage에만 저장됩니다.
-      </p>
+      <!-- 설정 탭 -->
+      <div id="shn-tab-settings" class="shn-tab-content">
+        <div style="margin-bottom: 25px;">
+          <h3 style="color: var(--text, #e8e8e8); margin-bottom: 12px; font-size: 0.95rem;">
+            🤖 Gemini API
+            ${hasEmbeddedLLM ? '<span style="color: var(--success, #4ecca3); font-size: 0.75rem; margin-left: 8px;">✓ 템플릿 설정됨</span>' : ''}
+          </h3>
+          <div style="margin-bottom: 10px;">
+            <label style="display: block; color: var(--text-dim, #888); font-size: 0.85rem; margin-bottom: 4px;">API Key</label>
+            <input type="password" id="shn-llm-apikey" value="${llm.apiKey || ''}" placeholder="${hasEmbeddedLLM ? '(템플릿에서 설정됨)' : 'AIza...'}" ${hasEmbeddedLLM ? 'disabled' : ''} style="
+              width: 100%;
+              padding: 10px 12px;
+              background: var(--bg-card, #1a1a2e);
+              border: 1px solid var(--border, #2a2a4a);
+              border-radius: 6px;
+              color: var(--text, #e8e8e8);
+              font-size: 0.9rem;
+              ${hasEmbeddedLLM ? 'opacity: 0.6;' : ''}
+            ">
+          </div>
+          <div>
+            <label style="display: block; color: var(--text-dim, #888); font-size: 0.85rem; margin-bottom: 4px;">Model</label>
+            <select id="shn-llm-model" style="
+              width: 100%;
+              padding: 10px 12px;
+              background: var(--bg-card, #1a1a2e);
+              border: 1px solid var(--border, #2a2a4a);
+              border-radius: 6px;
+              color: var(--text, #e8e8e8);
+              font-size: 0.9rem;
+            ">
+              <option value="gemini-3.0-pro" ${llm.model === 'gemini-3.0-pro' ? 'selected' : ''}>Gemini 3.0 Pro</option>
+              <option value="gemini-2.0-flash" ${llm.model === 'gemini-2.0-flash' ? 'selected' : ''}>Gemini 2.0 Flash</option>
+              <option value="gemini-2.0-flash-lite" ${llm.model === 'gemini-2.0-flash-lite' ? 'selected' : ''}>Gemini 2.0 Flash Lite</option>
+              <option value="gemini-1.5-pro" ${llm.model === 'gemini-1.5-pro' ? 'selected' : ''}>Gemini 1.5 Pro</option>
+              <option value="gemini-1.5-flash" ${llm.model === 'gemini-1.5-flash' ? 'selected' : ''}>Gemini 1.5 Flash</option>
+            </select>
+          </div>
+        </div>
+        
+        <div style="margin-bottom: 25px;">
+          <h3 style="color: var(--text, #e8e8e8); margin-bottom: 12px; font-size: 0.95rem;">
+            🔥 Firebase
+            ${hasEmbeddedFirebase ? '<span style="color: var(--success, #4ecca3); font-size: 0.75rem; margin-left: 8px;">✓ 템플릿 설정됨</span>' : ''}
+          </h3>
+          <div style="margin-bottom: 10px;">
+            <label style="display: block; color: var(--text-dim, #888); font-size: 0.85rem; margin-bottom: 4px;">API Key</label>
+            <input type="password" id="shn-fb-apikey" value="${firebase.apiKey || ''}" placeholder="${hasEmbeddedFirebase ? '(템플릿에서 설정됨)' : 'Firebase API Key'}" ${hasEmbeddedFirebase ? 'disabled' : ''} style="
+              width: 100%;
+              padding: 10px 12px;
+              background: var(--bg-card, #1a1a2e);
+              border: 1px solid var(--border, #2a2a4a);
+              border-radius: 6px;
+              color: var(--text, #e8e8e8);
+              font-size: 0.9rem;
+              ${hasEmbeddedFirebase ? 'opacity: 0.6;' : ''}
+            ">
+          </div>
+          <div style="margin-bottom: 10px;">
+            <label style="display: block; color: var(--text-dim, #888); font-size: 0.85rem; margin-bottom: 4px;">Project ID</label>
+            <input type="text" id="shn-fb-projectid" value="${firebase.projectId || ''}" placeholder="${hasEmbeddedFirebase ? '(템플릿에서 설정됨)' : 'my-project-id'}" ${hasEmbeddedFirebase ? 'disabled' : ''} style="
+              width: 100%;
+              padding: 10px 12px;
+              background: var(--bg-card, #1a1a2e);
+              border: 1px solid var(--border, #2a2a4a);
+              border-radius: 6px;
+              color: var(--text, #e8e8e8);
+              font-size: 0.9rem;
+              ${hasEmbeddedFirebase ? 'opacity: 0.6;' : ''}
+            ">
+          </div>
+        </div>
+        
+        <div style="display: flex; gap: 10px;">
+          <button id="shn-settings-save" style="
+            flex: 1;
+            padding: 12px;
+            background: var(--accent, #ffd700);
+            color: #000;
+            border: none;
+            border-radius: 6px;
+            font-weight: bold;
+            cursor: pointer;
+            transition: opacity 0.2s;
+          ">💾 저장</button>
+          <button id="shn-settings-clear" style="
+            padding: 12px 20px;
+            background: transparent;
+            color: var(--error, #ff6b6b);
+            border: 1px solid var(--error, #ff6b6b);
+            border-radius: 6px;
+            cursor: pointer;
+          ">🗑️</button>
+        </div>
+        
+        <p style="margin-top: 15px; font-size: 0.75rem; color: var(--text-dim, #888); text-align: center;">
+          🔒 localStorage 설정은 템플릿 설정보다 우선순위가 낮습니다.
+        </p>
+      </div>
+      
+      <!-- 세션 탭 -->
+      <div id="shn-tab-sessions" class="shn-tab-content" style="display: none;">
+        <div style="margin-bottom: 15px; display: flex; gap: 10px;">
+          <button id="shn-refresh-sessions" style="
+            padding: 10px 16px;
+            background: var(--bg-card, #1a1a2e);
+            color: var(--text, #e8e8e8);
+            border: 1px solid var(--border, #2a2a4a);
+            border-radius: 6px;
+            cursor: pointer;
+          ">🔄 새로고침</button>
+          <span id="shn-session-status" style="color: var(--text-dim, #888); font-size: 0.85rem; align-self: center;"></span>
+        </div>
+        
+        <div id="shn-sessions-list" style="
+          max-height: 400px;
+          overflow-y: auto;
+          border: 1px solid var(--border, #2a2a4a);
+          border-radius: 8px;
+          background: var(--bg-card, #1a1a2e);
+        ">
+          <p style="padding: 20px; color: var(--text-dim, #888); text-align: center;">
+            세션을 로드하려면 새로고침을 클릭하세요.
+          </p>
+        </div>
+      </div>
     </div>
   `;
   
   document.body.appendChild(modal);
+  
+  // 탭 전환 이벤트
+  modal.querySelectorAll('.shn-tab-btn').forEach(btn => {
+    btn.onclick = () => {
+      const tabId = btn.dataset.tab;
+      
+      // 버튼 스타일 토글
+      modal.querySelectorAll('.shn-tab-btn').forEach(b => {
+        b.style.background = 'var(--bg-card, #1a1a2e)';
+        b.style.color = 'var(--text-dim, #888)';
+        b.style.fontWeight = 'normal';
+      });
+      btn.style.background = 'var(--accent, #ffd700)';
+      btn.style.color = '#000';
+      btn.style.fontWeight = 'bold';
+      
+      // 탭 콘텐츠 토글
+      modal.querySelectorAll('.shn-tab-content').forEach(c => c.style.display = 'none');
+      document.getElementById('shn-tab-' + tabId).style.display = 'block';
+    };
+  });
   
   // 이벤트 바인딩
   document.getElementById('shn-settings-close').onclick = () => modal.remove();
@@ -879,12 +922,12 @@ function openSettingsModal() {
       },
       firebase: {
         apiKey: document.getElementById('shn-fb-apikey').value.trim(),
-        projectId: document.getElementById('shn-fb-projectid').value.trim(),
-        authDomain: document.getElementById('shn-fb-authdomain').value.trim()
+        projectId: document.getElementById('shn-fb-projectid').value.trim()
       }
     };
     
     // 빈 값 제거
+    if (!newConfig.llm.apiKey) delete newConfig.llm.apiKey;
     if (!newConfig.firebase.apiKey) delete newConfig.firebase;
     
     saveConfig(newConfig);
@@ -897,12 +940,607 @@ function openSettingsModal() {
   };
   
   document.getElementById('shn-settings-clear').onclick = () => {
-    if (confirm('모든 설정을 초기화할까요?')) {
+    if (confirm('모든 localStorage 설정을 초기화할까요?')) {
       localStorage.removeItem(CONFIG_KEY);
       modal.remove();
-      openSettingsModal(); // 다시 열기
+      openSettingsModal();
     }
   };
+  
+  // 세션 새로고침 이벤트
+  document.getElementById('shn-refresh-sessions').onclick = loadSessionsList;
+}
+
+/**
+ * 세션 목록 로드 (Firebase에서)
+ */
+async function loadSessionsList() {
+  const statusEl = document.getElementById('shn-session-status');
+  const listEl = document.getElementById('shn-sessions-list');
+  
+  // Firebase 설정 확인
+  if (!initFirebase()) {
+    listEl.innerHTML = '<p style="padding: 20px; color: var(--error, #ff6b6b); text-align: center;">⚠️ Firebase 설정이 필요합니다.</p>';
+    return;
+  }
+  
+  statusEl.textContent = '로딩 중...';
+  listEl.innerHTML = '<p style="padding: 20px; color: var(--text-dim, #888); text-align: center;">⏳ 세션 로딩 중...</p>';
+  
+  try {
+    // 세션 목록 조회 (shn-sessions 컬렉션)
+    const sessions = await firestoreList('shn-sessions');
+    
+    // updatedAt으로 정렬 (최신순)
+    sessions.sort((a, b) => {
+      const aTime = a.updatedAt?.toMillis ? a.updatedAt.toMillis() : 0;
+      const bTime = b.updatedAt?.toMillis ? b.updatedAt.toMillis() : 0;
+      return bTime - aTime;
+    });
+    
+    sessionsCache = sessions;
+    
+    if (sessions.length === 0) {
+      listEl.innerHTML = '<p style="padding: 20px; color: var(--text-dim, #888); text-align: center;">저장된 세션이 없습니다.</p>';
+      statusEl.textContent = '0개 세션';
+      return;
+    }
+    
+    statusEl.textContent = `${sessions.length}개 세션`;
+    
+    // 세션 목록 렌더링
+    listEl.innerHTML = sessions.map((session, idx) => `
+      <div class="shn-session-item" data-idx="${idx}" style="
+        padding: 12px 15px;
+        border-bottom: 1px solid var(--border, #2a2a4a);
+        cursor: pointer;
+        transition: background 0.2s;
+      " onmouseover="this.style.background='rgba(255,215,0,0.1)'" onmouseout="this.style.background='transparent'">
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+          <div>
+            <div style="color: var(--text, #e8e8e8); font-weight: 500; margin-bottom: 4px;">
+              ${escapeHtml(session.title || session.theme || 'Untitled')}
+            </div>
+            <div style="color: var(--text-dim, #888); font-size: 0.8rem;">
+              ${session.turnCount || 0} 턴 · ${formatDate(session.updatedAt)}
+            </div>
+          </div>
+          <div style="display: flex; gap: 8px;">
+            <button class="shn-session-export" data-idx="${idx}" title="JSON 내보내기" style="
+              padding: 6px 10px;
+              background: var(--bg-card, #1a1a2e);
+              color: var(--accent, #ffd700);
+              border: 1px solid var(--accent, #ffd700);
+              border-radius: 4px;
+              cursor: pointer;
+              font-size: 0.85rem;
+            ">📥</button>
+          </div>
+        </div>
+      </div>
+    `).join('');
+    
+    // 내보내기 버튼 이벤트
+    listEl.querySelectorAll('.shn-session-export').forEach(btn => {
+      btn.onclick = async (e) => {
+        e.stopPropagation();
+        const idx = parseInt(btn.dataset.idx);
+        await exportSessionAsJSON(sessionsCache[idx]);
+      };
+    });
+    
+    // 세션 클릭 이벤트 (상세 보기)
+    listEl.querySelectorAll('.shn-session-item').forEach(item => {
+      item.onclick = async () => {
+        const idx = parseInt(item.dataset.idx);
+        await showSessionDetail(sessionsCache[idx]);
+      };
+    });
+    
+  } catch (error) {
+    console.error('세션 로드 실패:', error);
+    listEl.innerHTML = `<p style="padding: 20px; color: var(--error, #ff6b6b); text-align: center;">❌ 로드 실패: ${error.message}</p>`;
+    statusEl.textContent = '오류';
+  }
+}
+
+/**
+ * 세션 상세 보기
+ */
+async function showSessionDetail(session) {
+  const listEl = document.getElementById('shn-sessions-list');
+  const statusEl = document.getElementById('shn-session-status');
+  
+  statusEl.textContent = '턴 로딩 중...';
+  
+  try {
+    // 세션의 턴들 조회 (하위 컬렉션)
+    const turns = await firestoreList(`shn-sessions/${session._id}/turns`, 'turnNumber', 100);
+    
+    // 기존 추출 데이터 확인
+    let existingExtraction = null;
+    try {
+      existingExtraction = await firestoreGet('extractions', session._id + '_micro');
+    } catch (e) { /* 없으면 무시 */ }
+    
+    listEl.innerHTML = `
+      <div style="padding: 15px;">
+        <button id="shn-back-to-list" style="
+          padding: 8px 12px;
+          background: transparent;
+          color: var(--text-dim, #888);
+          border: 1px solid var(--border, #2a2a4a);
+          border-radius: 4px;
+          cursor: pointer;
+          margin-bottom: 15px;
+        ">← 목록으로</button>
+        
+        <h3 style="color: var(--accent, #ffd700); margin-bottom: 10px;">
+          ${escapeHtml(session.title || session.theme || 'Untitled')}
+        </h3>
+        <p style="color: var(--text-dim, #888); font-size: 0.85rem; margin-bottom: 15px;">
+          ${session.turnCount || 0} 턴 · 생성: ${formatDate(session.createdAt)}
+          ${existingExtraction ? ' · <span style="color: var(--success, #4ecca3);">✓ 추출됨</span>' : ''}
+        </p>
+        
+        <!-- 내보내기 옵션 -->
+        <div style="margin-bottom: 20px; padding: 15px; background: var(--bg-card, #1a1a2e); border-radius: 8px; border: 1px solid var(--border, #2a2a4a);">
+          <h4 style="color: var(--text, #e8e8e8); margin-bottom: 12px; font-size: 0.9rem;">📥 내보내기</h4>
+          
+          <div style="display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px;">
+            <button id="shn-export-raw" style="
+              padding: 8px 14px;
+              background: var(--bg-secondary, #12121e);
+              color: var(--text, #e8e8e8);
+              border: 1px solid var(--border, #2a2a4a);
+              border-radius: 6px;
+              cursor: pointer;
+              font-size: 0.85rem;
+            ">📄 Raw JSON</button>
+            <button id="shn-export-extracted" style="
+              padding: 8px 14px;
+              background: ${existingExtraction ? 'var(--accent, #ffd700)' : 'var(--bg-secondary, #12121e)'};
+              color: ${existingExtraction ? '#000' : 'var(--text-dim, #888)'};
+              border: 1px solid ${existingExtraction ? 'var(--accent, #ffd700)' : 'var(--border, #2a2a4a)'};
+              border-radius: 6px;
+              cursor: pointer;
+              font-size: 0.85rem;
+            " ${existingExtraction ? '' : 'disabled'}>🧠 추출 데이터</button>
+          </div>
+          
+          <p style="font-size: 0.75rem; color: var(--text-dim, #888);">
+            ${existingExtraction ? 
+              `마지막 추출: ${formatDate(existingExtraction.extractedAt)}` : 
+              'LLM 추출을 먼저 실행하세요.'
+            }
+          </p>
+        </div>
+        
+        <!-- LLM 추출 -->
+        <div style="margin-bottom: 20px; padding: 15px; background: var(--bg-card, #1a1a2e); border-radius: 8px; border: 1px solid var(--border, #2a2a4a);">
+          <h4 style="color: var(--text, #e8e8e8); margin-bottom: 12px; font-size: 0.9rem;">🧠 데이터 정제 (Narrative Data Refiner)</h4>
+          
+          <div style="display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px;">
+            <button id="shn-extract-micro" style="
+              padding: 10px 18px;
+              background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+              color: white;
+              border: none;
+              border-radius: 6px;
+              cursor: pointer;
+              font-size: 0.9rem;
+              font-weight: 500;
+            ">⚙️ 데이터 정제 시작</button>
+          </div>
+          
+          <p style="font-size: 0.75rem; color: var(--text-dim, #888); line-height: 1.5;">
+            턴 단위로 Markdown 데이터를 SHN JSON으로 변환합니다.<br>
+            청킹 크기를 입력하면 순차적으로 처리됩니다.
+          </p>
+          </div>
+          
+          <p style="font-size: 0.75rem; color: var(--text-dim, #888); line-height: 1.5;">
+            턴 단위로 Markdown 데이터를 SHN JSON으로 변환합니다.<br>
+            청킹 크기를 입력하면 순차적으로 처리됩니다. (예: 10턴씩)
+          </p>
+          
+          <div id="shn-extraction-progress" style="display: none; margin-top: 12px; padding: 12px; background: rgba(102, 126, 234, 0.1); border-radius: 6px; border: 1px solid rgba(102, 126, 234, 0.3);">
+            <p id="shn-progress-text" style="font-size: 0.85rem; color: var(--text, #e8e8e8); margin-bottom: 8px;">처리 중...</p>
+            <div style="background: var(--bg-secondary, #12121e); border-radius: 4px; height: 8px; overflow: hidden;">
+              <div id="shn-progress-bar" style="background: linear-gradient(90deg, #667eea 0%, #764ba2 100%); height: 100%; width: 0%; transition: width 0.3s;"></div>
+            </div>
+          </div>
+        </div>
+        
+        <!-- 턴 목록 -->
+        <h4 style="color: var(--text, #e8e8e8); margin-bottom: 10px;">턴 목록</h4>
+        <div id="shn-turns-list" style="
+          max-height: 200px;
+          overflow-y: auto;
+          border: 1px solid var(--border, #2a2a4a);
+          border-radius: 6px;
+        ">
+          ${turns.length === 0 ? 
+            '<p style="padding: 15px; color: var(--text-dim, #888); text-align: center;">턴 데이터 없음</p>' :
+            turns.map((turn, idx) => `
+              <div style="padding: 10px 15px; border-bottom: 1px solid var(--border, #2a2a4a); color: var(--text, #e8e8e8); font-size: 0.9rem;">
+                <strong>턴 ${turn.turnNumber || idx + 1}</strong>
+                ${turn.sceneTitle ? ` - ${escapeHtml(turn.sceneTitle)}` : ''}
+              </div>
+            `).join('')
+          }
+        </div>
+      </div>
+    `;
+    
+    statusEl.textContent = `${turns.length} 턴`;
+    
+    // 뒤로가기
+    document.getElementById('shn-back-to-list').onclick = loadSessionsList;
+    
+    // Raw JSON 내보내기
+    document.getElementById('shn-export-raw').onclick = () => exportSessionAsJSON(session, turns, 'raw');
+    
+    // 추출 데이터 내보내기
+    const exportExtractedBtn = document.getElementById('shn-export-extracted');
+    if (existingExtraction) {
+      exportExtractedBtn.onclick = () => exportSessionAsJSON(session, turns, 'extracted', existingExtraction);
+    }
+    
+    // LLM 추출 버튼 이벤트 (단일 버튼)
+    document.getElementById('shn-extract-micro').onclick = () => runExtraction(session, turns);
+    
+  } catch (error) {
+    console.error('세션 상세 로드 실패:', error);
+    listEl.innerHTML = `<p style="padding: 20px; color: var(--error, #ff6b6b);">❌ 로드 실패: ${error.message}</p>`;
+  }
+}
+
+/**
+ * Narrative Data Refiner 프롬프트 템플릿 (bundle.js TEMPLATE_NARRATIVE_DATA_REFINER 참조)
+ */
+const NARRATIVE_DATA_REFINER_PROMPT = `You are a 'State Reconstruction Engine'. Your sole purpose is to convert one or more narrative turn logs, written in Markdown, back into complete, minified SHN (State History Narrative) JSON objects.
+
+**ABSOLUTE LAW:** Your final output MUST be a single code block. Inside this block, each generated JSON object must be separated by a comma. There must be NO other text or explanation.
+
+---
+### **Core Task: Multiple Markdown Logs -> Multiple SHN JSON Objects**
+
+You will receive a Markdown text containing one or more 'turn' blocks, each starting with \`## [턴 N]\`. Your task is to:
+1.  Identify each individual \`## [턴 N]\` block.
+2.  For **EACH** block, parse it and construct one complete SHN JSON object representing the state at the end of that specific turn.
+3.  Combine all the generated JSON objects into a single response, separating each object with a comma.
+
+---
+### **SHN Schema & Rules (MANDATORY)**
+
+For each turn block, you MUST construct a JSON object with the following structure:
+1.  **Root Structure:** The JSON root must have: \`m\`, \`p\`, \`s\`, \`x\`, \`h\`, \`z\`. Populate them with plausible data inferred from the log.
+2.  **Chronicle (\`h\`):** Must be an array with one object for the turn. This object must contain:
+    *   \`nt\` (narrative_text): From the "### 생성된 서사" section.
+    *   \`sc\` (selected_choice): From the "### 사용자 선택" section.
+    *   \`pc\` (presented_choices): An array of strings from the "### 제시된 선택지" section.
+    *   \`ss\` (state_snapshot): An object reconstructed from "### 상태 정보" and "### 주변 탐색". Use the minified keys below.
+3.  **Last Snapshot (\`z\`):** The \`z.ss\` key must be a direct copy of the \`ss\` object you just constructed for that turn.
+4.  **World State (\`x\`):** The \`x.tn\` key must be the turn number from that turn's \`## [턴 N]\` heading.
+5.  **Headers (\`ss\`):** Identify the **very last** \`## [턴 N]\` block within the entire input you receive. **ONLY** for this last block, scan for \`### @mainTitle: ...\` and \`### @mainSubtitle: ...\`. If found, their content MUST be stored in that turn's \`ss\` object with the keys \`mt\` and \`mst\` respectively. All other preceding turn blocks MUST NOT include these keys.
+
+---
+### **[CRITICAL] Minified Key Dictionary (Label -> Key)**
+
+*   "생명력" / "체력": "hp"
+*   "@mainTitle": "mt"
+*   "@mainSubtitle": "mst"
+*   "정신력": "sp"
+*   "허기": "hg"
+*   "갈증": "th"
+*   "피로": "fg"
+*   "체온": "tp"
+*   "희망": "ho"
+*   "주변 온도": "at"
+*   "날씨": "we"
+*   "달의 위상" / "월령": "lp"
+*   "장소" / "현재 위치": "lc"
+*   "이름": "nm"
+*   "나이": "ag"
+*   "상태": "st"
+*   "🚨 CRITICAL" / "위험": "cs"
+*   "현재 날짜": "dt"
+*   "현재 시간": "tm"
+*   "경과": "el"
+*   "감각": "sn"
+*   "바람": "wd"
+*   "소지품": "iv"
+*   "진행중인 사건": "ev"
+*   The full Markdown table from "### 주변 탐색" -> value for the "scan" key.`;
+
+/**
+ * LLM 추출 실행 (bundle.js 방식 - 청킹 + 순차 처리)
+ */
+async function runExtraction(session, turns) {
+  const llmConfig = getLLMConfig();
+  if (!llmConfig.apiKey) {
+    alert('Gemini API 키가 필요합니다. 설정에서 입력하세요.');
+    return;
+  }
+  
+  // 턴 수 입력 프롬프트
+  const chunkSizeStr = prompt('몇 개의 턴을 한 묶음으로 처리할까요?\n(기본값: 10, 최대 100)', '10');
+  if (!chunkSizeStr) return; // 취소
+  
+  const chunkSize = Math.max(1, Math.min(100, parseInt(chunkSizeStr, 10) || 10));
+  
+  const progressEl = document.getElementById('shn-extraction-progress');
+  const progressBar = document.getElementById('shn-progress-bar');
+  const progressText = document.getElementById('shn-progress-text');
+  const statusEl = document.getElementById('shn-session-status');
+  
+  progressEl.style.display = 'block';
+  progressBar.style.width = '0%';
+  progressText.textContent = '추출 준비 중...';
+  
+  try {
+    // 1. 모든 턴을 Markdown 형식으로 변환
+    const allMarkdown = turns.map(t => {
+      const content = t.content || t.narrative || '';
+      // 이미 "## [턴 N]" 형식이면 그대로, 아니면 추가
+      if (content.trim().startsWith('## [턴')) {
+        return content;
+      } else {
+        return `## [턴 ${t.turnNumber}]\n\n${content}`;
+      }
+    }).join('\n\n');
+    
+    // 2. "## [턴" 기준으로 분리
+    const turnBlocks = allMarkdown.split(/(?=## \[턴)/).filter(b => b.trim());
+    
+    // 3. chunkSize만큼 묶기
+    const chunks = [];
+    for (let i = 0; i < turnBlocks.length; i += chunkSize) {
+      chunks.push(turnBlocks.slice(i, i + chunkSize).join('\n\n'));
+    }
+    
+    if (chunks.length === 0) {
+      throw new Error('처리할 턴 데이터가 없습니다.');
+    }
+    
+    // 4. 순차 처리
+    const accumulatedResults = [];
+    for (let i = 0; i < chunks.length; i++) {
+      progressText.textContent = `데이터 정제 중... (${i + 1}/${chunks.length})`;
+      progressBar.style.width = `${((i + 1) / chunks.length) * 100}%`;
+      
+      const userMessage = `--- 데이터 시작 ---\n${chunks[i]}\n--- 데이터 끝 ---`;
+      
+      // LLM API 호출
+      const result = await callLLM(userMessage, NARRATIVE_DATA_REFINER_PROMPT);
+      accumulatedResults.push(result);
+      
+      // API 과부하 방지 (마지막 청크 제외)
+      if (i < chunks.length - 1) {
+        await new Promise(resolve => setTimeout(resolve, 2000)); // 2초 대기
+      }
+    }
+    
+    // 5. 결과 병합 (쉼표로 구분된 JSON 객체들)
+    const finalResult = accumulatedResults.filter(r => r.trim()).join(',\n');
+    
+    progressBar.style.width = '100%';
+    progressText.textContent = '✅ 추출 완료!';
+    
+    // 6. Firebase에 저장 (선택 사항)
+    if (firebaseConfig && session._id) {
+      try {
+        await firestoreSet(`shn-sessions/${session._id}/extractions`, `extraction_${Date.now()}`, {
+          chunkSize,
+          totalChunks: chunks.length,
+          result: finalResult,
+          createdAt: new Date().toISOString()
+        });
+        statusEl.textContent = '✅ 추출 결과가 저장되었습니다.';
+      } catch (saveError) {
+        console.warn('Firebase 저장 실패:', saveError);
+        statusEl.textContent = '⚠️ 추출 완료 (저장 실패)';
+      }
+    } else {
+      statusEl.textContent = '✅ 추출 완료!';
+    }
+    
+    // 7. 결과 표시 (콘솔)
+    console.log('=== 추출 결과 ===');
+    console.log(finalResult);
+    console.log('================');
+    
+    // 8. 다운로드 옵션 제공
+    const shouldDownload = confirm('추출 결과를 JSON 파일로 다운로드하시겠습니까?');
+    if (shouldDownload) {
+      const blob = new Blob([`[${finalResult}]`], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${sanitizeFilename(session.title || session.subject || 'session')}_refined_${Date.now()}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    }
+    
+    setTimeout(() => {
+      progressEl.style.display = 'none';
+      statusEl.textContent = '';
+    }, 3000);
+    
+  } catch (error) {
+    console.error('추출 실패:', error);
+    progressText.textContent = '❌ 추출 실패';
+    statusEl.textContent = `❌ 오류: ${error.message}`;
+    setTimeout(() => {
+      progressEl.style.display = 'none';
+      statusEl.textContent = '';
+    }, 3000);
+  }
+}
+
+/**
+ * 세션을 SHN JSON 파일로 내보내기
+ * @param {object} session - 세션 데이터
+ * @param {array} turns - 턴 데이터
+ * @param {string} exportType - 'raw' 또는 'extracted'
+ * @param {object} extractionData - 추출 데이터 (optional)
+ */
+async function exportSessionAsJSON(session, turns, exportType, extractionData) {
+  if (exportType === undefined) exportType = 'raw';
+  
+  const statusEl = document.getElementById('shn-session-status');
+  
+  try {
+    statusEl.textContent = '내보내기 준비 중...';
+    
+    // 턴 데이터가 없으면 로드
+    if (!turns) {
+      turns = await firestoreList(`sessions/${session._id}/turns`, 'turnNumber', 100);
+    }
+    
+    let shnData;
+    let filenamePrefix;
+    
+    if (exportType === 'extracted' && extractionData) {
+      // 추출 데이터 포맷
+      filenamePrefix = 'shn_extracted';
+      
+      // 모든 추출 레벨 데이터 가져오기
+      let microData = null, mesoData = null, macroData = null;
+      
+      try {
+        microData = await firestoreGet('extractions', session._id + '_micro');
+      } catch (e) { /* 없으면 무시 */ }
+      
+      try {
+        mesoData = await firestoreGet('extractions', session._id + '_meso');
+      } catch (e) { /* 없으면 무시 */ }
+      
+      try {
+        macroData = await firestoreGet('extractions', session._id + '_macro');
+      } catch (e) { /* 없으면 무시 */ }
+      
+      shnData = {
+        meta: {
+          version: "shn-lite-1.0",
+          format: "extracted",
+          exportedAt: new Date().toISOString(),
+          sessionId: session._id,
+          title: session.title || session.theme || 'Untitled',
+          theme: session.theme,
+          turnCount: session.turnCount || turns.length
+        },
+        extraction: {
+          micro: microData ? {
+            extractedAt: microData.extractedAt,
+            data: microData.data
+          } : null,
+          meso: mesoData ? {
+            extractedAt: mesoData.extractedAt,
+            data: mesoData.data
+          } : null,
+          macro: macroData ? {
+            extractedAt: macroData.extractedAt,
+            data: macroData.data
+          } : null
+        },
+        // 원본 데이터도 포함 (선택적)
+        rawTurns: turns.map(t => ({
+          turnNumber: t.turnNumber,
+          sceneTitle: t.sceneTitle,
+          timestamp: t.timestamp
+        }))
+      };
+      
+    } else {
+      // Raw 데이터 포맷
+      filenamePrefix = 'shn_raw';
+      
+      shnData = {
+        meta: {
+          version: "shn-lite-1.0",
+          format: "raw",
+          exportedAt: new Date().toISOString(),
+          sessionId: session._id,
+          title: session.title || session.theme || 'Untitled',
+          theme: session.theme,
+          turnCount: session.turnCount || turns.length,
+          createdAt: session.createdAt,
+          updatedAt: session.updatedAt
+        },
+        session: {
+          ...session,
+          _id: undefined
+        },
+        turns: turns.map(t => ({
+          ...t,
+          _id: undefined
+        }))
+      };
+    }
+    
+    // JSON 파일 다운로드
+    const blob = new Blob([JSON.stringify(shnData, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${filenamePrefix}_${sanitizeFilename(session.title || session.theme || 'session')}_${session._id || Date.now()}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    
+    statusEl.textContent = '✅ 내보내기 완료!';
+    setTimeout(() => {
+      statusEl.textContent = '';
+    }, 2000);
+    
+  } catch (error) {
+    console.error('내보내기 실패:', error);
+    statusEl.textContent = '❌ 내보내기 실패';
+  }
+}
+
+/**
+ * 유틸: HTML 이스케이프
+ */
+function escapeHtml(text) {
+  if (!text) return '';
+  return String(text)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+/**
+ * 유틸: 날짜 포맷
+ */
+function formatDate(dateValue) {
+  if (!dateValue) return '-';
+  try {
+    const date = dateValue instanceof Date ? dateValue : new Date(dateValue);
+    return date.toLocaleDateString('ko-KR', { 
+      year: 'numeric', 
+      month: 'short', 
+      day: 'numeric' 
+    });
+  } catch {
+    return '-';
+  }
+}
+
+/**
+ * 유틸: 파일명 정리
+ */
+function sanitizeFilename(name) {
+  return String(name)
+    .replace(/[<>:"/\\|?*]/g, '_')
+    .replace(/\s+/g, '_')
+    .substring(0, 50);
 }
 
 // ============================================
@@ -911,22 +1549,20 @@ function openSettingsModal() {
 global.renderAppShell = renderAppShell;
 global.SHNLiteCanvas = {
   renderAppShell: renderAppShell,
-  chunkByMarker: chunkByMarker,
   initFirebase: initFirebase,
   loadConfig: loadConfig,
   saveConfig: saveConfig,
   getLLMConfig: getLLMConfig,
+  getEmbeddedConfig: getEmbeddedConfig,
   // Firebase REST API
   firestoreSet: firestoreSet,
   firestoreGet: firestoreGet,
   firestoreList: firestoreList,
-  // LLM 추출 함수들
-  callLLM: callLLM,
-  extractMicro: extractMicro,
-  extractMeso: extractMeso,
-  extractMacro: extractMacro,
-  batchExtract: batchExtract,
-  saveExtractedData: saveExtractedData,
+  // 세션 관리
+  loadSessionsList: loadSessionsList,
+  showSessionDetail: showSessionDetail,
+  runExtraction: runExtraction,
+  exportSessionAsJSON: exportSessionAsJSON,
   // 설정 UI
   openSettingsModal: openSettingsModal,
   createSettingsButton: createSettingsButton
