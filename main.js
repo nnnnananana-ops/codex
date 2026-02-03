@@ -101,7 +101,7 @@ function getFirestoreUrl(collectionPath, docId) {
   const projectId = firebaseConfig?.projectId;
   if (!projectId) return null;
   
-  let url = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/${collectionPath}`;
+  let url = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/codex/documents/${collectionPath}`;
   if (docId) {
     url += `/${docId}`;
   }
@@ -1582,3 +1582,4 @@ if (typeof document !== 'undefined') {
 }
 
 })(typeof window !== 'undefined' ? window : this);
+
