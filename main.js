@@ -1233,13 +1233,32 @@ async function showSessionDetail(session) {
     // 뒤로가기
     document.getElementById('shn-back-to-list').onclick = loadSessionsList;
     
-    // 세션 삭제
-    document.getElementById('shn-delete-session').onclick = async () => {
-      if (!confirm(`"${session.title || session.subject || 'Untitled'}" 세션을 정말 삭제하시겠습니까?\n\n이 작업은 되돌릴 수 없습니다.`)) {
+    // 세션 삭제 (2단계 확인)
+    const deleteBtn = document.getElementById('shn-delete-session');
+    let deleteConfirmPending = false;
+    
+    deleteBtn.onclick = async () => {
+      if (!deleteConfirmPending) {
+        // 1단계: 확인 요청
+        deleteBtn.textContent = '⚠️ 다시 클릭하면 삭제';
+        deleteBtn.style.background = 'var(--error, #ff6b6b)';
+        deleteBtn.style.color = '#fff';
+        deleteConfirmPending = true;
+        
+        setTimeout(() => {
+          if (deleteConfirmPending) {
+            deleteBtn.textContent = '🗑️ 삭제';
+            deleteBtn.style.background = 'transparent';
+            deleteBtn.style.color = 'var(--error, #ff6b6b)';
+            deleteConfirmPending = false;
+          }
+        }, 3000);
         return;
       }
       
+      // 2단계: 실제 삭제
       try {
+        deleteBtn.disabled = true;
         statusEl.textContent = '삭제 중...';
         
         // 하위 컬렉션 삭제 (turns)
@@ -1282,7 +1301,11 @@ async function showSessionDetail(session) {
       } catch (error) {
         console.error('세션 삭제 실패:', error);
         statusEl.textContent = '❌ 삭제 실패';
-        alert(`삭제 실패: ${error.message}`);
+        deleteBtn.disabled = false;
+        deleteBtn.textContent = '🗑️ 삭제';
+        deleteBtn.style.background = 'transparent';
+        deleteBtn.style.color = 'var(--error, #ff6b6b)';
+        deleteConfirmPending = false;
       }
     };
     
@@ -1525,18 +1548,15 @@ async function runExtraction(session, turns) {
     console.log('================');
     
     // 8. 다운로드 옵션 제공
-    const shouldDownload = confirm('추출 결과를 JSON 파일로 다운로드하시겠습니까?');
-    if (shouldDownload) {
-      const blob = new Blob([`[${finalResult}]`], { type: 'application/json' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `${sanitizeFilename(session.title || session.subject || 'session')}_refined_${Date.now()}.json`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-    }
+    const blob = new Blob([`[${finalResult}]`], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${sanitizeFilename(session.title || session.subject || 'session')}_refined_${Date.now()}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
     
     setTimeout(() => {
       progressEl.style.display = 'none';
