@@ -34,6 +34,16 @@ const appId = 'the-edge-canvas';  // 앱 식별자
 // ============================================
 async function initFirebase() {
   try {
+    // Firebase SDK 로드 확인
+    if (typeof firebase === 'undefined') {
+      console.error('❌ Firebase SDK가 로드되지 않았습니다.');
+      console.error('HTML에 다음 스크립트를 추가하세요:');
+      console.error('<script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-app-compat.js"></script>');
+      console.error('<script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-auth-compat.js"></script>');
+      console.error('<script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-firestore-compat.js"></script>');
+      return false;
+    }
+    
     // Google Gemini Canvas Mode에서 자동 주입된 config 사용
     const configStr = typeof __firebase_config !== 'undefined' ? __firebase_config : null;
     const authToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
@@ -468,10 +478,8 @@ function renderAppShell(rawHtmlContent, title, canvasId) {
   // Dashboard JSON 파싱 및 렌더링
   renderDashboard();
   
-  // Firebase 저장 (설정 있으면)
-  if (initFirebase()) {
-    saveCanvasToFirebase(rawHtmlContent, title, canvasId);
-  }
+  // Firebase 저장 (자동 - bundle.js 패턴)
+  saveCanvasToFirebase(rawHtmlContent, title, canvasId);
 }
 
 // Dashboard JSON → HTML 렌더링
@@ -608,9 +616,13 @@ function convertHtmlToMarkdown(htmlContent, turn) {
   return markdown;
 }
 
-// Firebase 저장 (세션 기반) - bundle.js 구조 적용
+// Firebase 저장 (세션 기반) - bundle.js 패턴으로 매 턴 자동 저장
 async function saveCanvasToFirebase(content, title, canvasId) {
-  if (!firebaseConfig) return;
+  // Firebase 초기화 확인
+  if (!db || !currentUser) {
+    console.warn('⚠️ Firebase 미초기화 - 턴 저장 건너뜀');
+    return;
+  }
   
   try {
     // data-turn 추출
@@ -626,62 +638,53 @@ async function saveCanvasToFirebase(content, title, canvasId) {
     
     // 세션 ID 결정: 주제가 바뀌면 새 세션 생성
     if (!currentSessionId || currentSubject !== subject) {
-      // 기존 세션 검색 (같은 주제)
-      const existingSessions = await firestoreList('shn-sessions');
-      const matchingSession = existingSessions.find(s => s.subject === subject);
+      // 기존 세션 검색 (같은 주제) - Firestore SDK 사용
+      const snapshot = await sessionsCollectionRef
+        .where('subject', '==', subject)
+        .limit(1)
+        .get();
       
-      if (matchingSession) {
-        currentSessionId = matchingSession._id;
+      if (!snapshot.empty) {
+        // 기존 세션 재사용
+        const doc = snapshot.docs[0];
+        currentSessionId = doc.id;
+        currentSubject = subject;
+        console.log('📂 기존 세션 재사용:', currentSessionId);
       } else {
         // 새 세션 생성
-        const sessionData = {
-          subject: subject,
-          title: `[${subject}] 서사 기록`,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-          turnCount: 0
-        };
-        
-        // Firestore REST API로 문서 생성 (자동 ID)
-        const response = await fetch(
-          `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/(default)/documents/shn-sessions?key=${firebaseConfig.apiKey}`,
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ fields: convertToFirestoreFields(sessionData) })
-          }
-        );
-        
-        if (!response.ok) throw new Error('세션 생성 실패');
-        
-        const doc = await response.json();
-        currentSessionId = doc.name.split('/').pop();
+        const newSessionId = await createSession(subject, {});
+        if (!newSessionId) {
+          throw new Error('세션 생성 실패');
+        }
+        console.log('📂 새 세션 생성:', newSessionId);
       }
-      
-      currentSubject = subject;
     }
     
-    // 턴 데이터를 세션의 하위 컬렉션에 저장
+    // 턴 데이터를 세션의 하위 컬렉션에 저장 (Firestore SDK)
     const turnData = {
       turnNumber: turn,
       content: markdown,
       rawHtml: content,
-      title: title,
-      timestamp: serverTimestamp()
+      sceneTitle: title,
+      timestamp: firebase.firestore.FieldValue.serverTimestamp()
     };
     
-    await firestoreSet(`shn-sessions/${currentSessionId}/turns`, `turn_${turn}`, turnData);
+    await sessionsCollectionRef
+      .doc(currentSessionId)
+      .collection('turns')
+      .doc(`turn_${turn}`)
+      .set(turnData, { merge: true });
     
     // 세션의 턴 카운트 업데이트
-    await firestoreSet('shn-sessions', currentSessionId, {
-      updatedAt: serverTimestamp(),
+    await sessionsCollectionRef.doc(currentSessionId).update({
+      updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
       turnCount: turn,
       lastTurnTitle: title
     });
     
-    console.log('✅ 세션 저장됨:', currentSessionId, '| 주제:', subject, '| 턴:', turn);
+    console.log(`✅ 턴 ${turn} 자동 저장됨 | 세션: ${currentSessionId} | 주제: ${subject}`);
   } catch (e) {
-    console.error('Canvas 저장 실패:', e);
+    console.error('❌ Canvas 저장 실패:', e);
   }
 }
 
@@ -690,16 +693,7 @@ async function saveCanvasToFirebase(content, title, canvasId) {
  */
 function convertToFirestoreFields(data) {
   const fields = {};
-  for (const [key, value] of Object.entries(data)) {
-    fields[key] = convertToFirestoreValue(value);
-  }
-  return fields;
-}
-
-// ============================================
-// 설정 UI
-// ============================================
-
+ / convertToFirestoreFields 함수 제거 (더 이상 필요 없음 - SDK 사용)
 function createSettingsButton() {
   // 이미 있으면 생성 안 함
   if (document.getElementById('shn-settings-btn')) return;
@@ -1676,25 +1670,35 @@ if (typeof document !== 'undefined') {
     document.addEventListener('DOMContentLoaded', async function() {
       console.log('📜 SHN Canvas 로드됨 (Google Gemini Canvas Mode)');
       
-      // Firebase 자동 초기화 시도
-      const initialized = await initFirebase();
-      if (initialized) {
-        console.log('✅ Firebase 자동 초기화 완료');
+      // Firebase SDK 확인 후 초기화
+      if (typeof firebase !== 'undefined') {
+        const initialized = await initFirebase();
+        if (initialized) {
+          console.log('✅ Firebase 자동 초기화 완료');
+        } else {
+          console.warn('⚠️ Firebase 초기화 실패 - Google Gemini Canvas Mode에서만 작동합니다');
+        }
       } else {
-        console.warn('⚠️ Firebase 초기화 실패 - Google Gemini Canvas Mode에서만 작동합니다');
+        console.warn('⚠️ Firebase SDK가 로드되지 않았습니다. HTML에 Firebase 스크립트를 추가하세요.');
       }
       
       createSettingsButton();
     });
   } else {
     console.log('📜 SHN Canvas 로드됨 (Google Gemini Canvas Mode)');
-    initFirebase().then(initialized => {
-      if (initialized) {
-        console.log('✅ Firebase 자동 초기화 완료');
-      } else {
-        console.warn('⚠️ Firebase 초기화 실패 - Google Gemini Canvas Mode에서만 작동합니다');
-      }
-    });
+    
+    if (typeof firebase !== 'undefined') {
+      initFirebase().then(initialized => {
+        if (initialized) {
+          console.log('✅ Firebase 자동 초기화 완료');
+        } else {
+          console.warn('⚠️ Firebase 초기화 실패 - Google Gemini Canvas Mode에서만 작동합니다');
+        }
+      });
+    } else {
+      console.warn('⚠️ Firebase SDK가 로드되지 않았습니다. HTML에 Firebase 스크립트를 추가하세요.');
+    }
+    
     createSettingsButton();
   }
 }
