@@ -688,12 +688,6 @@ async function saveCanvasToFirebase(content, title, canvasId) {
   }
 }
 
-/**
- * Firestore 필드 변환 헬퍼
- */
-function convertToFirestoreFields(data) {
-  const fields = {};
- / convertToFirestoreFields 함수 제거 (더 이상 필요 없음 - SDK 사용)
 function createSettingsButton() {
   // 이미 있으면 생성 안 함
   if (document.getElementById('shn-settings-btn')) return;
