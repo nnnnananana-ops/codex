@@ -16,253 +16,295 @@
 // ============================================
 // 내부 상태
 // ============================================
-let firebaseConfig = null;
+let db = null;  // Firestore 인스턴스
+let currentUser = null;  // Firebase 사용자
 let currentSessionId = null;
 let currentSubject = null;  // 현재 주제 (세션 식별용)
 let sessionsCache = [];
+let userApiSettings = {};  // API 설정 (bundle.js 패턴)
+
+// Firestore 컬렉션 참조들
+let sessionsCollectionRef = null;
+let userSettingsRef = null;
+
+const appId = 'the-edge-canvas';  // 앱 식별자
 
 // ============================================
-// 설정 관리 (window.__CODEX_CONFIG__ 우선, localStorage 폴백)
+// Firebase 초기화 (Google Gemini 플랫폼 패턴)
 // ============================================
-const CONFIG_KEY = 'shn-lite-config';
+async function initFirebase() {
+  try {
+    // Google Gemini Canvas Mode에서 자동 주입된 config 사용
+    const configStr = typeof __firebase_config !== 'undefined' ? __firebase_config : null;
+    const authToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+    
+    if (!configStr) {
+      console.warn('⚠️ Google Gemini Canvas Mode에서만 작동합니다. __firebase_config가 없습니다.');
+      return false;
+    }
+    
+    const firebaseConfig = JSON.parse(configStr);
+    
+    // Firebase 초기화 (이미 초기화되었으면 스킵)
+    if (!firebase.apps.length) {
+      firebase.initializeApp(firebaseConfig);
+    }
+    
+    const auth = firebase.auth();
+    db = firebase.firestore();
+    
+    // 로컬 지속성 설정
+    await auth.setPersistence(firebase.auth.Auth.Persistence.LOCAL);
+    
+    // Long Polling 설정 (Google Gemini 환경 최적화)
+    try {
+      db.settings({ experimentalForceLongPolling: true });
+    } catch (e) {
+      // 이미 설정된 경우 무시
+    }
+    
+    // 인증 처리
+    if (!auth.currentUser) {
+      if (authToken) {
+        await auth.signInWithCustomToken(authToken).catch(async () => {
+          await auth.signInAnonymously();
+        });
+      } else {
+        await auth.signInAnonymously();
+      }
+    }
+    
+    currentUser = auth.currentUser;
+    
+    if (!currentUser) {
+      console.error('Firebase 인증 실패');
+      return false;
+    }
+    
+    // Firestore 컬렉션 참조 설정 (bundle.js 패턴)
+    const basePath = `artifacts/${appId}/users/${currentUser.uid}`;
+    sessionsCollectionRef = db.collection(`${basePath}/sessions`);
+    userSettingsRef = db.collection(`${basePath}/settings`).doc('userSettings');
+    
+    // 사용자 설정 로드
+    await loadUserSettingsFromFirebase();
+    
+    console.log('✅ Firebase 연결 완료! (사용자:', currentUser.uid, ')');
+    return true;
+    
+  } catch (error) {
+    console.error('Firebase 초기화 실패:', error);
+    return false;
+  }
+}
+
+// ============================================
+// API 설정 관리 (bundle.js 패턴)
+// ============================================
 
 /**
- * 임베디드 설정 가져오기 (HTML 템플릿에서 하드코딩된 값)
+ * Firestore에서 사용자 설정 로드
  */
-function getEmbeddedConfig() {
-  const embedded = global.__CODEX_CONFIG__;
-  if (!embedded) return null;
-  
-  // 플레이스홀더가 아닌 실제 값인지 확인
-  const isValidKey = (key) => key && !key.startsWith('{YOUR_');
-  
+async function loadUserSettingsFromFirebase() {
+  try {
+    const doc = await userSettingsRef.get();
+    if (doc.exists) {
+      const data = doc.data();
+      userApiSettings = data.userApiSettings || {};
+      console.log('✅ API 설정 로드 완료');
+    } else {
+      // 기본 설정 생성
+      userApiSettings = {
+        apiPresets: [{
+          name: 'Default',
+          provider: 'gemini',
+          apiKey: '',
+          model: 'gemini-2.0-flash-exp',
+          tokensUsed: 0
+        }]
+      };
+      await saveUserSettingsToFirebase();
+    }
+  } catch (error) {
+    console.error('설정 로드 실패:', error);
+    userApiSettings = {
+      apiPresets: [{
+        name: 'Default',
+        provider: 'gemini',
+        apiKey: '',
+        model: 'gemini-2.0-flash-exp',
+        tokensUsed: 0
+      }]
+    };
+  }
+}
+
+/**
+ * Firestore에 사용자 설정 저장
+ */
+async function saveUserSettingsToFirebase() {
+  try {
+    await userSettingsRef.set({
+      userApiSettings: userApiSettings,
+      updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+    console.log('✅ API 설정 저장 완료');
+  } catch (error) {
+    console.error('설정 저장 실패:', error);
+  }
+}
+
+/**
+ * API 키 가져오기 (현재 선택된 preset에서)
+ */
+function getApiKey() {
+  const presets = userApiSettings.apiPresets || [];
+  const currentPreset = presets[0];  // 첫 번째 preset 사용
+  return currentPreset?.apiKey || '';
+}
+
+/**
+ * API 설정 가져오기
+ */
+function getApiConfig() {
+  const presets = userApiSettings.apiPresets || [];
+  const currentPreset = presets[0];  // 첫 번째 preset 사용
   return {
-    firebase: isValidKey(embedded.firebaseApiKey) ? {
-      apiKey: embedded.firebaseApiKey,
-      projectId: embedded.firebaseProjectId
-    } : null,
-    llm: isValidKey(embedded.geminiApiKey) ? {
-      apiKey: embedded.geminiApiKey,
-      model: embedded.geminiModel || 'gemini-2.0-flash'
-    } : null
+    apiKey: currentPreset?.apiKey || '',
+    model: currentPreset?.model || 'gemini-2.0-flash-exp',
+    provider: currentPreset?.provider || 'gemini'
   };
 }
 
-function loadConfig() {
+/**
+ * API 키 설정 (UI에서 호출)
+ */
+async function setApiKey(apiKey, model = 'gemini-2.0-flash-exp') {
+  if (!userApiSettings.apiPresets) {
+    userApiSettings.apiPresets = [];
+  }
+  
+  // 첫 번째 preset 업데이트 또는 생성
+  if (userApiSettings.apiPresets.length === 0) {
+    userApiSettings.apiPresets.push({
+      name: 'Default',
+      provider: 'gemini',
+      apiKey: apiKey,
+      model: model,
+      tokensUsed: 0
+    });
+  } else {
+    userApiSettings.apiPresets[0].apiKey = apiKey;
+    userApiSettings.apiPresets[0].model = model;
+  }
+  
+  await saveUserSettingsToFirebase();
+}
+
+// ============================================
+// 세션 관리 (Firestore SDK 사용)
+// ============================================
+
+/**
+ * 세션 목록 로드
+ */
+async function loadSessions() {
+  if (!db) {
+    console.warn('Firebase 미초기화');
+    return [];
+  }
+  
   try {
-    return JSON.parse(localStorage.getItem(CONFIG_KEY)) || {};
-  } catch {
-    return {};
+    const snapshot = await sessionsCollectionRef
+      .orderBy('updatedAt', 'desc')
+      .limit(50)
+      .get();
+    
+    sessionsCache = [];
+    snapshot.forEach(doc => {
+      sessionsCache.push({ id: doc.id, ...doc.data() });
+    });
+    
+    return sessionsCache;
+  } catch (error) {
+    console.error('세션 목록 로드 실패:', error);
+    return [];
   }
-}
-
-function saveConfig(config) {
-  localStorage.setItem(CONFIG_KEY, JSON.stringify(config));
-}
-
-function getFirebaseConfig() {
-  // 1. 임베디드 설정 우선
-  const embedded = getEmbeddedConfig();
-  if (embedded?.firebase) return embedded.firebase;
-  
-  // 2. localStorage 폴백
-  const config = loadConfig();
-  return config.firebase || null;
-}
-
-function getLLMConfig() {
-  // 1. 임베디드 설정 우선
-  const embedded = getEmbeddedConfig();
-  if (embedded?.llm) return embedded.llm;
-  
-  // 2. localStorage 폴백
-  const config = loadConfig();
-  return config.llm || { apiKey: '', model: 'gemini-2.0-flash' };
-}
-
-// ============================================
-// Firebase 초기화 (REST API 사용)
-// ============================================
-function initFirebase() {
-  firebaseConfig = getFirebaseConfig();
-  if (!firebaseConfig || !firebaseConfig.apiKey || !firebaseConfig.projectId) {
-    console.warn('Firebase 설정이 필요합니다. (apiKey, projectId 필수)');
-    return false;
-  }
-  
-  console.log('✅ Firebase REST API 준비 완료!');
-  return true;
 }
 
 /**
- * Firestore REST API 기본 URL 생성
+ * 세션 생성
  */
-function getFirestoreUrl(collectionPath, docId) {
-  const projectId = firebaseConfig?.projectId;
-  if (!projectId) return null;
-  
-  let url = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/codex/documents/${collectionPath}`;
-  if (docId) {
-    url += `/${docId}`;
+async function createSession(subject, initialShn) {
+  if (!db) {
+    console.warn('Firebase 미초기화');
+    return null;
   }
-  return url;
+  
+  const sessionData = {
+    subject: subject,
+    shn: initialShn,
+    createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+    updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+  };
+  
+  try {
+    const docRef = await sessionsCollectionRef.add(sessionData);
+    currentSessionId = docRef.id;
+    currentSubject = subject;
+    console.log('✅ 새 세션 생성:', docRef.id);
+    return docRef.id;
+  } catch (error) {
+    console.error('세션 생성 실패:', error);
+    return null;
+  }
 }
 
 /**
- * Firestore 문서 저장 (PATCH - upsert)
+ * 세션 저장 (업데이트)
  */
-async function firestoreSet(collectionPath, docId, data) {
-  const url = getFirestoreUrl(collectionPath, docId);
-  if (!url) throw new Error('Firebase 설정 필요');
-  
-  // Firestore REST API 형식으로 변환
-  const fields = {};
-  for (const [key, value] of Object.entries(data)) {
-    fields[key] = convertToFirestoreValue(value);
+async function saveSession(shn) {
+  if (!db || !currentSessionId) {
+    console.warn('저장 실패: Firebase 미초기화 또는 세션 없음');
+    return;
   }
   
-  const response = await fetch(`${url}?key=${firebaseConfig.apiKey}`, {
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ fields })
-  });
-  
-  if (!response.ok) {
-    const error = await response.json().catch(() => ({}));
-    throw new Error(`Firestore 저장 실패: ${error.error?.message || response.statusText}`);
+  try {
+    await sessionsCollectionRef.doc(currentSessionId).update({
+      shn: shn,
+      updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+    });
+    console.log('✅ 세션 저장 완료:', currentSessionId);
+  } catch (error) {
+    console.error('세션 저장 실패:', error);
   }
-  
-  return await response.json();
 }
 
 /**
- * Firestore 문서 조회
+ * 세션 로드
  */
-async function firestoreGet(collectionPath, docId) {
-  const url = getFirestoreUrl(collectionPath, docId);
-  if (!url) throw new Error('Firebase 설정 필요');
-  
-  const response = await fetch(`${url}?key=${firebaseConfig.apiKey}`);
-  
-  if (response.status === 404) return null;
-  if (!response.ok) {
-    const error = await response.json().catch(() => ({}));
-    throw new Error(`Firestore 조회 실패: ${error.error?.message || response.statusText}`);
+async function loadSession(sessionId) {
+  if (!db) {
+    console.warn('Firebase 미초기화');
+    return null;
   }
   
-  const doc = await response.json();
-  return convertFromFirestoreDoc(doc);
-}
-
-/**
- * Firestore 컬렉션 조회
- */
-async function firestoreList(collectionPath, orderByField, limitCount) {
-  let url = getFirestoreUrl(collectionPath);
-  if (!url) throw new Error('Firebase 설정 필요');
-  
-  url += `?key=${firebaseConfig.apiKey}`;
-  if (orderByField) {
-    url += `&orderBy=${orderByField}`;
-  }
-  if (limitCount) {
-    url += `&pageSize=${limitCount}`;
-  }
-  
-  const response = await fetch(url);
-  
-  if (!response.ok) {
-    const error = await response.json().catch(() => ({}));
-    throw new Error(`Firestore 목록 조회 실패: ${error.error?.message || response.statusText}`);
-  }
-  
-  const result = await response.json();
-  return (result.documents || []).map(convertFromFirestoreDoc);
-}
-
-/**
- * JS 값 → Firestore 값 변환
- */
-function convertToFirestoreValue(value) {
-  if (value === null || value === undefined) {
-    return { nullValue: null };
-  }
-  if (typeof value === 'string') {
-    return { stringValue: value };
-  }
-  if (typeof value === 'number') {
-    return Number.isInteger(value) ? { integerValue: String(value) } : { doubleValue: value };
-  }
-  if (typeof value === 'boolean') {
-    return { booleanValue: value };
-  }
-  if (Array.isArray(value)) {
-    return { arrayValue: { values: value.map(convertToFirestoreValue) } };
-  }
-  if (value instanceof Date) {
-    return { timestampValue: value.toISOString() };
-  }
-  if (typeof value === 'object') {
-    // serverTimestamp 특수 처리
-    if (value._serverTimestamp) {
-      return { timestampValue: new Date().toISOString() };
+  try {
+    const doc = await sessionsCollectionRef.doc(sessionId).get();
+    if (!doc.exists) {
+      console.warn('세션을 찾을 수 없음:', sessionId);
+      return null;
     }
-    const fields = {};
-    for (const [k, v] of Object.entries(value)) {
-      fields[k] = convertToFirestoreValue(v);
-    }
-    return { mapValue: { fields } };
+    
+    const data = doc.data();
+    currentSessionId = sessionId;
+    currentSubject = data.subject;
+    console.log('✅ 세션 로드 완료:', sessionId);
+    return data.shn;
+  } catch (error) {
+    console.error('세션 로드 실패:', error);
+    return null;
   }
-  return { stringValue: String(value) };
-}
-
-/**
- * Firestore 문서 → JS 객체 변환
- */
-function convertFromFirestoreDoc(doc) {
-  if (!doc || !doc.fields) return null;
-  
-  const result = {};
-  for (const [key, value] of Object.entries(doc.fields)) {
-    result[key] = convertFromFirestoreValue(value);
-  }
-  
-  // 문서 ID 추가
-  if (doc.name) {
-    result._id = doc.name.split('/').pop();
-  }
-  
-  return result;
-}
-
-/**
- * Firestore 값 → JS 값 변환
- */
-function convertFromFirestoreValue(value) {
-  if ('stringValue' in value) return value.stringValue;
-  if ('integerValue' in value) return parseInt(value.integerValue, 10);
-  if ('doubleValue' in value) return value.doubleValue;
-  if ('booleanValue' in value) return value.booleanValue;
-  if ('nullValue' in value) return null;
-  if ('timestampValue' in value) return new Date(value.timestampValue);
-  if ('arrayValue' in value) {
-    return (value.arrayValue.values || []).map(convertFromFirestoreValue);
-  }
-  if ('mapValue' in value) {
-    const result = {};
-    for (const [k, v] of Object.entries(value.mapValue.fields || {})) {
-      result[k] = convertFromFirestoreValue(v);
-    }
-    return result;
-  }
-  return null;
-}
-
-/**
- * serverTimestamp 헬퍼
- */
-function serverTimestamp() {
-  return { _serverTimestamp: true };
 }
 
 // ============================================
@@ -602,7 +644,7 @@ async function saveCanvasToFirebase(content, title, canvasId) {
         
         // Firestore REST API로 문서 생성 (자동 ID)
         const response = await fetch(
-          `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/codex/documents/shn-sessions?key=${firebaseConfig.apiKey}`,
+          `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/(default)/documents/shn-sessions?key=${firebaseConfig.apiKey}`,
           {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -697,14 +739,10 @@ function openSettingsModal() {
     return;
   }
   
-  const config = loadConfig();
-  const llm = config.llm || {};
-  const firebase = config.firebase || {};
-  
-  // 임베디드 설정 확인
-  const embedded = getEmbeddedConfig();
-  const hasEmbeddedLLM = !!embedded?.llm;
-  const hasEmbeddedFirebase = !!embedded?.firebase;
+  // 현재 설정 가져오기
+  const apiConfig = getApiConfig();
+  const currentKey = apiConfig.apiKey || '';
+  const currentModel = apiConfig.model || 'gemini-2.0-flash-exp';
   
   const modal = document.createElement('div');
   modal.id = 'shn-settings-modal';
@@ -733,9 +771,16 @@ function openSettingsModal() {
       border: 1px solid var(--border, #2a2a4a);
     ">
       <h2 style="color: var(--accent, #ffd700); margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center;">
-        ⚙️ SHN Lite
+        ⚙️ The Edge - API 설정
         <button id="shn-settings-close" style="background: none; border: none; color: var(--text-dim, #888); font-size: 24px; cursor: pointer;">✕</button>
       </h2>
+      
+      <div style="margin-bottom: 20px; padding: 15px; background: var(--bg-info, #1a2332); border-left: 3px solid var(--accent, #ffd700); border-radius: 6px;">
+        <p style="color: var(--text, #e8e8e8); font-size: 0.9rem; margin: 0;">
+          🔒 <strong>Google Gemini Canvas Mode</strong>에서 실행 중입니다.<br>
+          API 키는 Google의 Firestore에 안전하게 저장됩니다.
+        </p>
+      </div>
       
       <!-- 탭 버튼 -->
       <div style="display: flex; gap: 5px; margin-bottom: 20px; border-bottom: 1px solid var(--border, #2a2a4a); padding-bottom: 10px;">
@@ -763,11 +808,10 @@ function openSettingsModal() {
         <div style="margin-bottom: 25px;">
           <h3 style="color: var(--text, #e8e8e8); margin-bottom: 12px; font-size: 0.95rem;">
             🤖 Gemini API
-            ${hasEmbeddedLLM ? '<span style="color: var(--success, #4ecca3); font-size: 0.75rem; margin-left: 8px;">✓ 템플릿 설정됨</span>' : ''}
           </h3>
           <div style="margin-bottom: 10px;">
             <label style="display: block; color: var(--text-dim, #888); font-size: 0.85rem; margin-bottom: 4px;">API Key</label>
-            <input type="password" id="shn-llm-apikey" value="${llm.apiKey || ''}" placeholder="${hasEmbeddedLLM ? '(템플릿에서 설정됨)' : 'AIza...'}" ${hasEmbeddedLLM ? 'disabled' : ''} style="
+            <input type="password" id="shn-llm-apikey" value="${currentKey}" placeholder="AIza..." style="
               width: 100%;
               padding: 10px 12px;
               background: var(--bg-card, #1a1a2e);
@@ -775,7 +819,6 @@ function openSettingsModal() {
               border-radius: 6px;
               color: var(--text, #e8e8e8);
               font-size: 0.9rem;
-              ${hasEmbeddedLLM ? 'opacity: 0.6;' : ''}
             ">
           </div>
           <div>
@@ -789,45 +832,11 @@ function openSettingsModal() {
               color: var(--text, #e8e8e8);
               font-size: 0.9rem;
             ">
-              <option value="gemini-3.0-pro" ${llm.model === 'gemini-3.0-pro' ? 'selected' : ''}>Gemini 3.0 Pro</option>
-              <option value="gemini-2.0-flash" ${llm.model === 'gemini-2.0-flash' ? 'selected' : ''}>Gemini 2.0 Flash</option>
-              <option value="gemini-2.0-flash-lite" ${llm.model === 'gemini-2.0-flash-lite' ? 'selected' : ''}>Gemini 2.0 Flash Lite</option>
-              <option value="gemini-1.5-pro" ${llm.model === 'gemini-1.5-pro' ? 'selected' : ''}>Gemini 1.5 Pro</option>
-              <option value="gemini-1.5-flash" ${llm.model === 'gemini-1.5-flash' ? 'selected' : ''}>Gemini 1.5 Flash</option>
+              <option value="gemini-2.0-flash-exp" ${currentModel === 'gemini-2.0-flash-exp' ? 'selected' : ''}>Gemini 2.0 Flash (Experimental)</option>
+              <option value="gemini-2.0-flash" ${currentModel === 'gemini-2.0-flash' ? 'selected' : ''}>Gemini 2.0 Flash</option>
+              <option value="gemini-1.5-pro" ${currentModel === 'gemini-1.5-pro' ? 'selected' : ''}>Gemini 1.5 Pro</option>
+              <option value="gemini-1.5-flash" ${currentModel === 'gemini-1.5-flash' ? 'selected' : ''}>Gemini 1.5 Flash</option>
             </select>
-          </div>
-        </div>
-        
-        <div style="margin-bottom: 25px;">
-          <h3 style="color: var(--text, #e8e8e8); margin-bottom: 12px; font-size: 0.95rem;">
-            🔥 Firebase
-            ${hasEmbeddedFirebase ? '<span style="color: var(--success, #4ecca3); font-size: 0.75rem; margin-left: 8px;">✓ 템플릿 설정됨</span>' : ''}
-          </h3>
-          <div style="margin-bottom: 10px;">
-            <label style="display: block; color: var(--text-dim, #888); font-size: 0.85rem; margin-bottom: 4px;">API Key</label>
-            <input type="password" id="shn-fb-apikey" value="${firebase.apiKey || ''}" placeholder="${hasEmbeddedFirebase ? '(템플릿에서 설정됨)' : 'Firebase API Key'}" ${hasEmbeddedFirebase ? 'disabled' : ''} style="
-              width: 100%;
-              padding: 10px 12px;
-              background: var(--bg-card, #1a1a2e);
-              border: 1px solid var(--border, #2a2a4a);
-              border-radius: 6px;
-              color: var(--text, #e8e8e8);
-              font-size: 0.9rem;
-              ${hasEmbeddedFirebase ? 'opacity: 0.6;' : ''}
-            ">
-          </div>
-          <div style="margin-bottom: 10px;">
-            <label style="display: block; color: var(--text-dim, #888); font-size: 0.85rem; margin-bottom: 4px;">Project ID</label>
-            <input type="text" id="shn-fb-projectid" value="${firebase.projectId || ''}" placeholder="${hasEmbeddedFirebase ? '(템플릿에서 설정됨)' : 'my-project-id'}" ${hasEmbeddedFirebase ? 'disabled' : ''} style="
-              width: 100%;
-              padding: 10px 12px;
-              background: var(--bg-card, #1a1a2e);
-              border: 1px solid var(--border, #2a2a4a);
-              border-radius: 6px;
-              color: var(--text, #e8e8e8);
-              font-size: 0.9rem;
-              ${hasEmbeddedFirebase ? 'opacity: 0.6;' : ''}
-            ">
           </div>
         </div>
         
@@ -842,19 +851,11 @@ function openSettingsModal() {
             font-weight: bold;
             cursor: pointer;
             transition: opacity 0.2s;
-          ">💾 저장</button>
-          <button id="shn-settings-clear" style="
-            padding: 12px 20px;
-            background: transparent;
-            color: var(--error, #ff6b6b);
-            border: 1px solid var(--error, #ff6b6b);
-            border-radius: 6px;
-            cursor: pointer;
-          ">🗑️</button>
+          ">💾 Firestore에 저장</button>
         </div>
         
         <p style="margin-top: 15px; font-size: 0.75rem; color: var(--text-dim, #888); text-align: center;">
-          🔒 localStorage 설정은 템플릿 설정보다 우선순위가 낮습니다.
+          🔒 설정은 사용자 전용 Firestore 경로에 암호화되어 저장됩니다.
         </p>
       </div>
       
@@ -914,36 +915,37 @@ function openSettingsModal() {
   document.getElementById('shn-settings-close').onclick = () => modal.remove();
   modal.onclick = (e) => { if (e.target === modal) modal.remove(); };
   
-  document.getElementById('shn-settings-save').onclick = () => {
-    const newConfig = {
-      llm: {
-        apiKey: document.getElementById('shn-llm-apikey').value.trim(),
-        model: document.getElementById('shn-llm-model').value
-      },
-      firebase: {
-        apiKey: document.getElementById('shn-fb-apikey').value.trim(),
-        projectId: document.getElementById('shn-fb-projectid').value.trim()
-      }
-    };
+  document.getElementById('shn-settings-save').onclick = async () => {
+    const apiKey = document.getElementById('shn-llm-apikey').value.trim();
+    const model = document.getElementById('shn-llm-model').value;
     
-    // 빈 값 제거
-    if (!newConfig.llm.apiKey) delete newConfig.llm.apiKey;
-    if (!newConfig.firebase.apiKey) delete newConfig.firebase;
+    if (!apiKey) {
+      alert('API 키를 입력해주세요.');
+      return;
+    }
     
-    saveConfig(newConfig);
+    if (!db) {
+      alert('Firebase가 초기화되지 않았습니다. Google Gemini Canvas Mode에서 실행해주세요.');
+      return;
+    }
     
-    // 성공 피드백
     const btn = document.getElementById('shn-settings-save');
-    btn.textContent = '✅ 저장됨!';
-    btn.style.background = 'var(--success, #4ecca3)';
-    setTimeout(() => modal.remove(), 800);
-  };
-  
-  document.getElementById('shn-settings-clear').onclick = () => {
-    if (confirm('모든 localStorage 설정을 초기화할까요?')) {
-      localStorage.removeItem(CONFIG_KEY);
-      modal.remove();
-      openSettingsModal();
+    btn.disabled = true;
+    btn.textContent = '💾 저장 중...';
+    
+    try {
+      await setApiKey(apiKey, model);
+      
+      // 성공 피드백
+      btn.textContent = '✅ Firestore에 저장됨!';
+      btn.style.background = 'var(--success, #4ecca3)';
+      setTimeout(() => modal.remove(), 1200);
+    } catch (error) {
+      console.error('설정 저장 실패:', error);
+      alert(`저장 실패: ${error.message}`);
+      btn.disabled = false;
+      btn.textContent = '💾 Firestore에 저장';
+      btn.style.background = 'var(--accent, #ffd700)';
     }
   };
   
@@ -1254,13 +1256,73 @@ For each turn block, you MUST construct a JSON object with the following structu
 *   "진행중인 사건": "ev"
 *   The full Markdown table from "### 주변 탐색" -> value for the "scan" key.`;
 
+// ============================================
+// LLM API 호출 (Gemini)
+// ============================================
+
+/**
+ * Gemini API 호출 함수
+ */
+async function callLLM(userMessage, systemPrompt = '') {
+  const apiConfig = getApiConfig();
+  
+  if (!apiConfig.apiKey) {
+    throw new Error('API 키가 설정되지 않았습니다.');
+  }
+  
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${apiConfig.model}:generateContent?key=${apiConfig.apiKey}`;
+  
+  // 시스템 프롬프트와 사용자 메시지 결합
+  const fullPrompt = systemPrompt 
+    ? `${systemPrompt}\n\n---\n\n${userMessage}`
+    : userMessage;
+  
+  const requestBody = {
+    contents: [{
+      parts: [{ text: fullPrompt }]
+    }],
+    generationConfig: {
+      temperature: 0.7,
+      maxOutputTokens: 8192
+    }
+  };
+  
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(requestBody)
+  });
+  
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Gemini API 호출 실패: ${response.status} - ${errorText}`);
+  }
+  
+  const data = await response.json();
+  
+  if (!data.candidates || !data.candidates[0] || !data.candidates[0].content) {
+    throw new Error('응답 형식이 올바르지 않습니다.');
+  }
+  
+  const textParts = data.candidates[0].content.parts || [];
+  const resultText = textParts.map(p => p.text || '').join('');
+  
+  // 코드 블록 제거 (```json ... ``` 또는 ```...```)
+  const codeBlockMatch = resultText.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+  if (codeBlockMatch) {
+    return codeBlockMatch[1].trim();
+  }
+  
+  return resultText.trim();
+}
+
 /**
  * LLM 추출 실행 (bundle.js 방식 - 청킹 + 순차 처리)
  */
 async function runExtraction(session, turns) {
-  const llmConfig = getLLMConfig();
-  if (!llmConfig.apiKey) {
-    alert('Gemini API 키가 필요합니다. 설정에서 입력하세요.');
+  const apiConfig = getApiConfig();
+  if (!apiConfig.apiKey) {
+    alert('Gemini API 키가 필요합니다.\nFirebase에 저장하려면 아래 함수를 사용하세요:\nwindow.SHNCanvas.setApiKey("YOUR_API_KEY")');
     return;
   }
   
@@ -1329,15 +1391,20 @@ async function runExtraction(session, turns) {
     progressText.textContent = '✅ 추출 완료!';
     
     // 6. Firebase에 저장 (선택 사항)
-    if (firebaseConfig && session._id) {
+    if (db && currentSessionId) {
       try {
-        await firestoreSet(`shn-sessions/${session._id}/extractions`, `extraction_${Date.now()}`, {
+        const extractionRef = sessionsCollectionRef.doc(currentSessionId)
+          .collection('extractions')
+          .doc(`extraction_${Date.now()}`);
+        
+        await extractionRef.set({
           chunkSize,
           totalChunks: chunks.length,
           result: finalResult,
-          createdAt: new Date().toISOString()
+          createdAt: firebase.firestore.FieldValue.serverTimestamp()
         });
-        statusEl.textContent = '✅ 추출 결과가 저장되었습니다.';
+        
+        statusEl.textContent = '✅ 추출 결과가 Firestore에 저장되었습니다.';
       } catch (saveError) {
         console.warn('Firebase 저장 실패:', saveError);
         statusEl.textContent = '⚠️ 추출 완료 (저장 실패)';
@@ -1547,40 +1614,74 @@ function sanitizeFilename(name) {
 // 전역 노출
 // ============================================
 global.renderAppShell = renderAppShell;
-global.SHNLiteCanvas = {
+global.SHNCanvas = {
+  // 앱 렌더링
   renderAppShell: renderAppShell,
+  
+  // Firebase 초기화 및 인증
   initFirebase: initFirebase,
-  loadConfig: loadConfig,
-  saveConfig: saveConfig,
-  getLLMConfig: getLLMConfig,
-  getEmbeddedConfig: getEmbeddedConfig,
-  // Firebase REST API
-  firestoreSet: firestoreSet,
-  firestoreGet: firestoreGet,
-  firestoreList: firestoreList,
+  
+  // API 설정 관리 (bundle.js 패턴)
+  getApiKey: getApiKey,
+  getApiConfig: getApiConfig,
+  setApiKey: setApiKey,
+  loadUserSettingsFromFirebase: loadUserSettingsFromFirebase,
+  saveUserSettingsToFirebase: saveUserSettingsToFirebase,
+  
   // 세션 관리
+  loadSessions: loadSessions,
+  createSession: createSession,
+  saveSession: saveSession,
+  loadSession: loadSession,
+  
+  // 세션 UI
   loadSessionsList: loadSessionsList,
   showSessionDetail: showSessionDetail,
+  
+  // 데이터 추출
   runExtraction: runExtraction,
   exportSessionAsJSON: exportSessionAsJSON,
+  
   // 설정 UI
   openSettingsModal: openSettingsModal,
-  createSettingsButton: createSettingsButton
+  createSettingsButton: createSettingsButton,
+  
+  // 내부 상태 접근 (디버깅용)
+  _getState: () => ({
+    db: db,
+    currentUser: currentUser,
+    currentSessionId: currentSessionId,
+    userApiSettings: userApiSettings
+  })
 };
 
 // 자동 초기화
 if (typeof document !== 'undefined') {
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', function() {
-      console.log('📜 SHN Lite Canvas 로드됨 (Pure JS)');
+    document.addEventListener('DOMContentLoaded', async function() {
+      console.log('📜 SHN Canvas 로드됨 (Google Gemini Canvas Mode)');
+      
+      // Firebase 자동 초기화 시도
+      const initialized = await initFirebase();
+      if (initialized) {
+        console.log('✅ Firebase 자동 초기화 완료');
+      } else {
+        console.warn('⚠️ Firebase 초기화 실패 - Google Gemini Canvas Mode에서만 작동합니다');
+      }
+      
       createSettingsButton();
     });
   } else {
-    console.log('📜 SHN Lite Canvas 로드됨 (Pure JS)');
+    console.log('📜 SHN Canvas 로드됨 (Google Gemini Canvas Mode)');
+    initFirebase().then(initialized => {
+      if (initialized) {
+        console.log('✅ Firebase 자동 초기화 완료');
+      } else {
+        console.warn('⚠️ Firebase 초기화 실패 - Google Gemini Canvas Mode에서만 작동합니다');
+      }
+    });
     createSettingsButton();
   }
 }
 
 })(typeof window !== 'undefined' ? window : this);
-
-
