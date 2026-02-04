@@ -960,9 +960,9 @@ async function loadSessionsList() {
   const statusEl = document.getElementById('shn-session-status');
   const listEl = document.getElementById('shn-sessions-list');
   
-  // Firebase 설정 확인
-  if (!initFirebase()) {
-    listEl.innerHTML = '<p style="padding: 20px; color: var(--error, #ff6b6b); text-align: center;">⚠️ Firebase 설정이 필요합니다.</p>';
+  // Firebase 초기화 확인
+  if (!db) {
+    listEl.innerHTML = '<p style="padding: 20px; color: var(--error, #ff6b6b); text-align: center;">⚠️ Firebase가 초기화되지 않았습니다.</p>';
     return;
   }
   
@@ -970,15 +970,8 @@ async function loadSessionsList() {
   listEl.innerHTML = '<p style="padding: 20px; color: var(--text-dim, #888); text-align: center;">⏳ 세션 로딩 중...</p>';
   
   try {
-    // 세션 목록 조회 (shn-sessions 컬렉션)
-    const sessions = await firestoreList('shn-sessions');
-    
-    // updatedAt으로 정렬 (최신순)
-    sessions.sort((a, b) => {
-      const aTime = a.updatedAt?.toMillis ? a.updatedAt.toMillis() : 0;
-      const bTime = b.updatedAt?.toMillis ? b.updatedAt.toMillis() : 0;
-      return bTime - aTime;
-    });
+    // 세션 목록 조회 (Firestore SDK 사용)
+    const sessions = await loadSessions();
     
     sessionsCache = sessions;
     
@@ -1056,13 +1049,32 @@ async function showSessionDetail(session) {
   statusEl.textContent = '턴 로딩 중...';
   
   try {
-    // 세션의 턴들 조회 (하위 컬렉션)
-    const turns = await firestoreList(`shn-sessions/${session._id}/turns`, 'turnNumber', 100);
+    // 세션의 턴들 조회 (하위 컬렉션 - Firestore SDK)
+    const turnsSnapshot = await sessionsCollectionRef
+      .doc(session.id)
+      .collection('turns')
+      .orderBy('turnNumber', 'asc')
+      .limit(100)
+      .get();
     
-    // 기존 추출 데이터 확인
+    const turns = [];
+    turnsSnapshot.forEach(doc => {
+      turns.push({ id: doc.id, ...doc.data() });
+    });
+    
+    // 기존 추출 데이터 확인 (하위 컬렉션)
     let existingExtraction = null;
     try {
-      existingExtraction = await firestoreGet('extractions', session._id + '_micro');
+      const extractionSnapshot = await sessionsCollectionRef
+        .doc(session.id)
+        .collection('extractions')
+        .orderBy('createdAt', 'desc')
+        .limit(1)
+        .get();
+      
+      if (!extractionSnapshot.empty) {
+        existingExtraction = extractionSnapshot.docs[0].data();
+      }
     } catch (e) { /* 없으면 무시 */ }
     
     listEl.innerHTML = `
@@ -1463,9 +1475,19 @@ async function exportSessionAsJSON(session, turns, exportType, extractionData) {
   try {
     statusEl.textContent = '내보내기 준비 중...';
     
-    // 턴 데이터가 없으면 로드
+    // 턴 데이터가 없으면 로드 (Firestore SDK)
     if (!turns) {
-      turns = await firestoreList(`sessions/${session._id}/turns`, 'turnNumber', 100);
+      const turnsSnapshot = await sessionsCollectionRef
+        .doc(session.id)
+        .collection('turns')
+        .orderBy('turnNumber', 'asc')
+        .limit(100)
+        .get();
+      
+      turns = [];
+      turnsSnapshot.forEach(doc => {
+        turns.push({ id: doc.id, ...doc.data() });
+      });
     }
     
     let shnData;
@@ -1475,19 +1497,20 @@ async function exportSessionAsJSON(session, turns, exportType, extractionData) {
       // 추출 데이터 포맷
       filenamePrefix = 'shn_extracted';
       
-      // 모든 추출 레벨 데이터 가져오기
-      let microData = null, mesoData = null, macroData = null;
+      // 가장 최근 추출 데이터 가져오기 (Firestore SDK)
+      let extractionData = null;
       
       try {
-        microData = await firestoreGet('extractions', session._id + '_micro');
-      } catch (e) { /* 없으면 무시 */ }
-      
-      try {
-        mesoData = await firestoreGet('extractions', session._id + '_meso');
-      } catch (e) { /* 없으면 무시 */ }
-      
-      try {
-        macroData = await firestoreGet('extractions', session._id + '_macro');
+        const extractionSnapshot = await sessionsCollectionRef
+          .doc(session.id)
+          .collection('extractions')
+          .orderBy('createdAt', 'desc')
+          .limit(1)
+          .get();
+        
+        if (!extractionSnapshot.empty) {
+          extractionData = extractionSnapshot.docs[0].data();
+        }
       } catch (e) { /* 없으면 무시 */ }
       
       shnData = {
@@ -1495,25 +1518,17 @@ async function exportSessionAsJSON(session, turns, exportType, extractionData) {
           version: "shn-lite-1.0",
           format: "extracted",
           exportedAt: new Date().toISOString(),
-          sessionId: session._id,
-          title: session.title || session.theme || 'Untitled',
-          theme: session.theme,
+          sessionId: session.id,
+          title: session.title || session.subject || 'Untitled',
+          subject: session.subject,
           turnCount: session.turnCount || turns.length
         },
-        extraction: {
-          micro: microData ? {
-            extractedAt: microData.extractedAt,
-            data: microData.data
-          } : null,
-          meso: mesoData ? {
-            extractedAt: mesoData.extractedAt,
-            data: mesoData.data
-          } : null,
-          macro: macroData ? {
-            extractedAt: macroData.extractedAt,
-            data: macroData.data
-          } : null
-        },
+        extraction: extractionData ? {
+          chunkSize: extractionData.chunkSize,
+          totalChunks: extractionData.totalChunks,
+          result: extractionData.result,
+          createdAt: extractionData.createdAt
+        } : null,
         // 원본 데이터도 포함 (선택적)
         rawTurns: turns.map(t => ({
           turnNumber: t.turnNumber,
@@ -1531,9 +1546,9 @@ async function exportSessionAsJSON(session, turns, exportType, extractionData) {
           version: "shn-lite-1.0",
           format: "raw",
           exportedAt: new Date().toISOString(),
-          sessionId: session._id,
-          title: session.title || session.theme || 'Untitled',
-          theme: session.theme,
+          sessionId: session.id,
+          title: session.title || session.subject || 'Untitled',
+          subject: session.subject,
           turnCount: session.turnCount || turns.length,
           createdAt: session.createdAt,
           updatedAt: session.updatedAt
@@ -1554,7 +1569,7 @@ async function exportSessionAsJSON(session, turns, exportType, extractionData) {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `${filenamePrefix}_${sanitizeFilename(session.title || session.theme || 'session')}_${session._id || Date.now()}.json`;
+    a.download = `${filenamePrefix}_${sanitizeFilename(session.title || session.subject || 'session')}_${session.id || Date.now()}.json`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
