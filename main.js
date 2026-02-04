@@ -478,8 +478,24 @@ function renderAppShell(rawHtmlContent, title, canvasId) {
   // Dashboard JSON 파싱 및 렌더링
   renderDashboard();
   
-  // Firebase 저장 (자동 - bundle.js 패턴)
-  saveCanvasToFirebase(rawHtmlContent, title, canvasId);
+  // Firebase 저장 (비동기 - 백그라운드에서 실행)
+  // Firebase 초기화를 기다렸다가 저장
+  (async () => {
+    if (!db || !currentUser) {
+      console.log('🔄 Firebase 초기화 대기 중...');
+      // 최대 5초 대기
+      for (let i = 0; i < 50; i++) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+        if (db && currentUser) break;
+      }
+    }
+    
+    if (db && currentUser) {
+      await saveCanvasToFirebase(rawHtmlContent, title, canvasId);
+    } else {
+      console.warn('⚠️ Firebase 초기화 타임아웃 - 저장 건너뜀');
+    }
+  })();
 }
 
 // Dashboard JSON → HTML 렌더링
@@ -686,6 +702,17 @@ async function saveCanvasToFirebase(content, title, canvasId) {
   } catch (e) {
     console.error('❌ Canvas 저장 실패:', e);
   }
+}
+
+/**
+ * Firestore 필드 변환 헬퍼
+ */
+function convertToFirestoreFields(data) {
+  const fields = {};
+  for (const [key, value] of Object.entries(data)) {
+    fields[key] = convertToFirestoreValue(value);
+  }
+  return fields;
 }
 
 function createSettingsButton() {
