@@ -641,9 +641,10 @@ async function saveCanvasToFirebase(content, title, canvasId) {
   }
   
   try {
-    // data-turn 추출
+    // data-turn 추출 (0-based를 1-based로 변환)
     const turnMatch = content.match(/data-turn=["'](\d+)["']/i);
-    const turn = turnMatch ? parseInt(turnMatch[1], 10) : 1;
+    const rawTurn = turnMatch ? parseInt(turnMatch[1], 10) : 0;
+    const turn = rawTurn + 1;  // 0→1, 1→2, 2→3 등으로 변환 (1-based 인덱싱)
     
     // data-subject (주제) 추출
     const subjectMatch = content.match(/data-subject=["']([^"']+)["']/i);
@@ -668,11 +669,17 @@ async function saveCanvasToFirebase(content, title, canvasId) {
         console.log('📂 기존 세션 재사용:', currentSessionId);
       } else {
         // 새 세션 생성
-        const newSessionId = await createSession(subject, {});
-        if (!newSessionId) {
-          throw new Error('세션 생성 실패');
-        }
-        console.log('📂 새 세션 생성:', newSessionId);
+        const sessionData = {
+          subject: subject,
+          title: `[${subject}] 서사 기록`,
+          createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+          updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+        };
+        
+        const docRef = await sessionsCollectionRef.add(sessionData);
+        currentSessionId = docRef.id;
+        currentSubject = subject;
+        console.log('📂 새 세션 생성:', currentSessionId);
       }
     }
     
@@ -691,16 +698,24 @@ async function saveCanvasToFirebase(content, title, canvasId) {
       .doc(`turn_${turn}`)
       .set(turnData, { merge: true });
     
-    // 세션의 턴 카운트 업데이트
+    // 세션의 턴 카운트 업데이트 (실제 최대 턴 번호로)
+    const turnsSnapshot = await sessionsCollectionRef
+      .doc(currentSessionId)
+      .collection('turns')
+      .get();
+    
+    const maxTurn = Math.max(...turnsSnapshot.docs.map(doc => doc.data().turnNumber || 0));
+    
     await sessionsCollectionRef.doc(currentSessionId).update({
       updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
-      turnCount: turn,
+      turnCount: maxTurn,
       lastTurnTitle: title
     });
     
     console.log(`✅ 턴 ${turn} 자동 저장됨 | 세션: ${currentSessionId} | 주제: ${subject}`);
   } catch (e) {
     console.error('❌ Canvas 저장 실패:', e);
+    console.error('에러 상세:', e.message, e.stack);
   }
 }
 
@@ -1104,11 +1119,22 @@ async function showSessionDetail(session) {
           margin-bottom: 15px;
         ">← 목록으로</button>
         
-        <h3 style="color: var(--accent, #ffd700); margin-bottom: 10px;">
-          ${escapeHtml(session.title || session.theme || 'Untitled')}
-        </h3>
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+          <h3 style="color: var(--accent, #ffd700); margin: 0;">
+            ${escapeHtml(session.title || session.theme || 'Untitled')}
+          </h3>
+          <button id="shn-delete-session" style="
+            padding: 6px 12px;
+            background: transparent;
+            color: var(--error, #ff6b6b);
+            border: 1px solid var(--error, #ff6b6b);
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.85rem;
+          ">🗑️ 삭제</button>
+        </div>
         <p style="color: var(--text-dim, #888); font-size: 0.85rem; margin-bottom: 15px;">
-          ${session.turnCount || 0} 턴 · 생성: ${formatDate(session.createdAt)}
+          ${turns.length} 턴 · 생성: ${formatDate(session.createdAt)}
           ${existingExtraction ? ' · <span style="color: var(--success, #4ecca3);">✓ 추출됨</span>' : ''}
         </p>
         
@@ -1206,6 +1232,59 @@ async function showSessionDetail(session) {
     
     // 뒤로가기
     document.getElementById('shn-back-to-list').onclick = loadSessionsList;
+    
+    // 세션 삭제
+    document.getElementById('shn-delete-session').onclick = async () => {
+      if (!confirm(`"${session.title || session.subject || 'Untitled'}" 세션을 정말 삭제하시겠습니까?\n\n이 작업은 되돌릴 수 없습니다.`)) {
+        return;
+      }
+      
+      try {
+        statusEl.textContent = '삭제 중...';
+        
+        // 하위 컬렉션 삭제 (turns)
+        const turnsSnapshot = await sessionsCollectionRef
+          .doc(session.id)
+          .collection('turns')
+          .get();
+        
+        const deleteTurns = [];
+        turnsSnapshot.forEach(doc => {
+          deleteTurns.push(doc.ref.delete());
+        });
+        await Promise.all(deleteTurns);
+        
+        // 하위 컬렉션 삭제 (extractions)
+        const extractionsSnapshot = await sessionsCollectionRef
+          .doc(session.id)
+          .collection('extractions')
+          .get();
+        
+        const deleteExtractions = [];
+        extractionsSnapshot.forEach(doc => {
+          deleteExtractions.push(doc.ref.delete());
+        });
+        await Promise.all(deleteExtractions);
+        
+        // 세션 문서 삭제
+        await sessionsCollectionRef.doc(session.id).delete();
+        
+        // 현재 세션이 삭제된 세션이면 초기화
+        if (currentSessionId === session.id) {
+          currentSessionId = null;
+          currentSubject = null;
+        }
+        
+        statusEl.textContent = '✅ 삭제 완료!';
+        setTimeout(() => {
+          loadSessionsList();
+        }, 500);
+      } catch (error) {
+        console.error('세션 삭제 실패:', error);
+        statusEl.textContent = '❌ 삭제 실패';
+        alert(`삭제 실패: ${error.message}`);
+      }
+    };
     
     // Raw JSON 내보내기
     document.getElementById('shn-export-raw').onclick = () => exportSessionAsJSON(session, turns, 'raw');
